@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Training artifacts
+outputs/
+logs/
+checkpoints/
+wandb/
+*.ckpt
+*.pt
+*.npy
+*.npz
+
+# Data
+data/
+*.bin
+*.idx
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local dev
+.ipynb_checkpoints/
+*.ipynb
+
+# Plan / doc artifacts (kept out of the repo per project policy)
+*.pdf
+docs/

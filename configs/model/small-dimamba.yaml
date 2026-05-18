@@ -1,0 +1,13 @@
+name: small-dimamba
+type: dimamba
+hidden_size: 768
+cond_dim: 128
+length: 1024
+n_blocks: 12
+# n_heads is informational only for dimamba (Mamba-2 uses headdim, not n_heads).
+n_heads: 12
+scale_by_sigma: True
+dropout: 0.1
+temb_strategy: adaln
+tie_word_embeddings: False
+# ssm_cfg left unset → create_block uses _MAMBA2_DEFAULTS (d_state=64, headdim=64)

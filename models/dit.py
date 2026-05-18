@@ -1,14 +1,21 @@
 import math
 import typing
 
-import flash_attn
-import flash_attn.layers.rotary
 import huggingface_hub
 import omegaconf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+# flash-attn is only used inside DDiTBlock.forward / apply_rotary_pos_emb.
+# Make it optional so the dimamba code path (which doesn't need it) can be
+# imported on environments without flash-attn (e.g. Colab without the wheel).
+try:
+    import flash_attn
+    import flash_attn.layers.rotary
+except ImportError:
+    flash_attn = None
 
 # Flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)

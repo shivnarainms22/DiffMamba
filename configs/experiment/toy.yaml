@@ -1,0 +1,38 @@
+# @package _global_
+#
+# Colab A100 smoke test — proves the pipeline runs end-to-end and produces
+# a checkpoint that all downstream eval scripts can consume. NOT a research run.
+#
+# Usage on Colab:
+#   python main.py +experiment=toy
+#
+# Expected: ~30 minutes on A100, 1000 steps, micro-dimamba (~50M params).
+# Triggers all 7 go/no-go gates in scripts/smoke_gates.py.
+
+defaults:
+  - override /model: micro-dimamba
+  - override /data: openwebtext-streaming  # no on-disk preprocess needed for smoke
+
+backbone: dimamba
+mode: train
+
+loader:
+  global_batch_size: 8
+  num_workers: 2
+
+trainer:
+  max_steps: 1000
+  val_check_interval: 200
+  log_every_n_steps: 10
+  num_sanity_val_steps: 0   # skip — we want step-0 loss without sanity-val noise
+
+# Don't wandb-log toy runs.
+wandb: null
+
+# Checkpoint cadence — every 200 steps so smoke_gates can load a mid-run ckpt.
+callbacks:
+  checkpoint_every_n_steps:
+    every_n_train_steps: 200
+
+checkpointing:
+  resume_from_ckpt: false

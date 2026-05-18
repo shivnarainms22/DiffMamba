@@ -1,0 +1,31 @@
+# @package _global_
+#
+# Scaling study — BiMamba-MDLM 50M. Same 40:1 tokens-per-param recipe → 2B tokens.
+# Steps: ceil(2B / (64 * 1024)) = 30518 → round to 30000.
+
+defaults:
+  - override /model: micro-dimamba
+  - override /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor, sigterm_save]
+
+backbone: dimamba
+parameterization: subs
+mode: train
+
+trainer:
+  max_steps: 30_000
+  val_check_interval: 3000
+  precision: 'bf16'
+
+loader:
+  global_batch_size: 64
+
+optim:
+  lr: 3e-4
+  weight_decay: 0.01
+
+callbacks:
+  hf_hub_uploader:
+    _target_: hf_hub_callback.HFHubUploadCallback
+    repo_id: ${oc.env:HF_HUB_REPO_ID,null}
+    every_n_train_steps: 3000
+    path_in_repo: scaling_50m

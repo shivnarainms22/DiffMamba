@@ -1,0 +1,13 @@
+# 100M scaling study config
+name: base-dimamba
+type: dimamba
+hidden_size: 640
+cond_dim: 128
+length: 1024
+n_blocks: 10
+# n_heads is informational only for dimamba (Mamba-2 uses headdim, not n_heads).
+n_heads: 10
+scale_by_sigma: True
+dropout: 0.1
+temb_strategy: adaln
+tie_word_embeddings: False

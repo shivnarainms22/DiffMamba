@@ -1,0 +1,3 @@
+sigterm_save:
+  _target_: callbacks_py.SigtermCheckpointCallback
+  save_filename: sigterm_save.ckpt

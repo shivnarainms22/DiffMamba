@@ -1,4 +1,4 @@
-name: tiny
+name: tiny-dimamba
 type: dimamba
 hidden_size: 512
 cond_dim: 128

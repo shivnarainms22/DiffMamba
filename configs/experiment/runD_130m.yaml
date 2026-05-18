@@ -1,0 +1,40 @@
+# @package _global_
+#
+# Run D — BiMamba-MDLM 130M. The headline run. ~28h on A100 spot.
+#
+# Usage on RunPod:
+#   python main.py +experiment=runD_130m seed=1
+#   python main.py +experiment=runD_130m seed=2  # second seed
+#
+# Plan reference: DiffuMamba-Micro Phase 4, "130M config" + MDLM training details.
+
+defaults:
+  - override /model: small-dimamba  # hidden=768, 12 layers, ~130M params
+  - override /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor, sigterm_save]
+
+backbone: dimamba
+parameterization: subs
+mode: train
+
+# 76000 steps × 64 seq × 1024 tok ≈ 5B tokens; matches MDLM 40:1 recipe at 130M.
+trainer:
+  max_steps: 76_000
+  val_check_interval: 5000
+  gradient_clip_val: 1.0
+  precision: 'bf16'
+
+loader:
+  global_batch_size: 64
+
+optim:
+  lr: 3e-4
+  weight_decay: 0.01
+
+# HF Hub backup every 5000 steps (preempt-safe on spot instances).
+# Configure ${HF_HUB_REPO_ID} via env var on RunPod before launch.
+callbacks:
+  hf_hub_uploader:
+    _target_: hf_hub_callback.HFHubUploadCallback
+    repo_id: ${oc.env:HF_HUB_REPO_ID,null}
+    every_n_train_steps: 5000
+    path_in_repo: runD_130m_seed${seed}

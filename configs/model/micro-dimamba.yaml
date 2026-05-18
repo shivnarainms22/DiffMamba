@@ -1,0 +1,14 @@
+# 50M scaling study config
+name: micro-dimamba
+type: dimamba
+hidden_size: 512
+cond_dim: 128
+length: 1024
+n_blocks: 8
+# n_heads is informational only for dimamba (Mamba-2 uses headdim, not n_heads).
+# Kept for parity with DiT configs; with headdim=64, effective heads = hidden_size/64.
+n_heads: 8
+scale_by_sigma: True
+dropout: 0.1
+temb_strategy: adaln
+tie_word_embeddings: False
