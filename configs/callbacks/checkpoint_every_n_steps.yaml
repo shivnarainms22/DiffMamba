@@ -5,7 +5,8 @@ checkpoint_every_n_steps:
   # volume is 50–100GB. Save_top_k=-1 would fill the disk and crash the run.
   save_top_k: 3
   save_last: True
-  monitor: null
+  monitor: step
+  mode: max
   dirpath: ${checkpointing.save_dir}/checkpoints
   verbose: True
   auto_insert_metric_name: False
