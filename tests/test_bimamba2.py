@@ -151,11 +151,15 @@ def test_adaln_finite_and_bounded():
     hs = out.hidden_states  # list of (B, L, D)
     if hs is not None and len(hs) >= 2:
         norms = [h.float().norm().item() for h in hs]
-        # Ratio between successive layers should be ~1 with gate=0; allow
-        # generous slack but well under 2x (the bug regime).
+        # With gate=0 init the gated mixer output is 0, so intermediate
+        # hidden_states are ~0; only non-zero → anything transitions are
+        # meaningful for catching the double-count bug.
         for a, b in zip(norms[:-1], norms[1:]):
-            assert b / max(a, 1e-6) < 1.5, \
-                f'Per-layer norm ratio {b/a:.3f} > 1.5 — suggests residual ' \
+            if a < 1e-3:
+                continue
+            ratio = b / a
+            assert ratio < 1.5, \
+                f'Per-layer norm ratio {ratio:.3f} > 1.5 — suggests residual ' \
                 f'double-count regression. Norms: {norms}'
 
 
