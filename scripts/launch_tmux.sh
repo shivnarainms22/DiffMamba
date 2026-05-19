@@ -48,6 +48,12 @@ CACHE_DIR="${DATA_CACHE_DIR:-/workspace/data}"
 echo "Dataset cache: ${CACHE_DIR}"
 mkdir -p "${CACHE_DIR}"
 
+# Wandb local cache: default lands on container disk (wiped on pod restart).
+# Keep it on the pod volume so runs survive preemption.
+export WANDB_DIR="${WANDB_DIR:-/workspace/wandb}"
+echo "Wandb dir: ${WANDB_DIR}"
+mkdir -p "${WANDB_DIR}"
+
 # PYTHONUNBUFFERED=1 + python -u → line-buffered output for live `tail -f`.
 # `tee` keeps a copy in the file even if the session is killed.
 CMD="PYTHONUNBUFFERED=1 python -u main.py +experiment=${EXPERIMENT} data.cache_dir=${CACHE_DIR} $* 2>&1 | tee ${LOG}"
