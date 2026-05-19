@@ -32,6 +32,11 @@ trainer:
   log_every_n_steps: 10
   num_sanity_val_steps: 0   # skip — we want step-0 loss without sanity-val noise
 
+# Smoke test — disable sample generation (128 DDPM steps × N val checks ≈ bulk of runtime).
+eval:
+  generate_samples: false
+  compute_generative_perplexity: false
+
 # Don't wandb-log toy runs.
 wandb: null
 
