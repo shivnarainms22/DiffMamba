@@ -147,11 +147,17 @@ def _ppl_eval(config, logger, tokenizer):
 
 def _train(config, logger, tokenizer):
   logger.info('Starting Training.')
-  wandb_logger = None
   if config.get('wandb', None) is not None:
     wandb_logger = L.pytorch.loggers.WandbLogger(
       config=omegaconf.OmegaConf.to_object(config),
       ** config.wandb)
+  else:
+    # No wandb — use CSV logger so metrics.csv exists for smoke_gates.
+    wandb_logger = L.pytorch.loggers.CSVLogger(
+      save_dir=config.checkpointing.save_dir,
+      name='logs',
+      flush_logs_every_n_steps=10,
+    )
 
   if (config.checkpointing.resume_from_ckpt
       and config.checkpointing.resume_ckpt_path is not None

@@ -149,6 +149,16 @@ def check_ckpt_loads(ctx):
     import dataloader
     import omegaconf
 
+    # PyTorch 2.6+ defaults weights_only=True; allowlist OmegaConf types
+    # stored in Lightning hyper_parameters so load_from_checkpoint succeeds.
+    try:
+        torch.serialization.add_safe_globals([
+            omegaconf.DictConfig,
+            omegaconf.ListConfig,
+        ])
+    except AttributeError:
+        pass  # PyTorch < 2.6
+
     ckpt = torch.load(ctx['ckpt'], map_location='cpu', weights_only=False)
     config = ckpt['hyper_parameters']['config']
     if isinstance(config, dict):
@@ -182,8 +192,13 @@ def check_resume(ctx):
     r = subprocess.run(
         [sys.executable, 'scripts/verify_checkpoint_resume.py'],
         capture_output=True, text=True, timeout=600)
+    if r.returncode == 0:
+        last = r.stdout.strip().splitlines()[-1] if r.stdout else 'ok'
+        return True, last
+    # On failure prefer stderr (Python/Hydra exceptions) over last stdout line.
+    err = r.stderr.strip()[-500:] if r.stderr else ''
     last = r.stdout.strip().splitlines()[-1] if r.stdout else ''
-    return r.returncode == 0, last or r.stderr[-200:]
+    return False, err or last
 
 
 def main():

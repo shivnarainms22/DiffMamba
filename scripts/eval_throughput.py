@@ -57,6 +57,16 @@ def load_model(ckpt_path: str, backbone: str):
     import dataloader
     import omegaconf
 
+    # PyTorch 2.6+ defaults weights_only=True; OmegaConf types stored in
+    # Lightning hyper_parameters must be allowlisted or load_from_checkpoint fails.
+    try:
+        torch.serialization.add_safe_globals([
+            omegaconf.DictConfig,
+            omegaconf.ListConfig,
+        ])
+    except AttributeError:
+        pass  # PyTorch < 2.6
+
     # The checkpoint stores hyper_parameters including the full config.
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     config = ckpt['hyper_parameters']['config']
