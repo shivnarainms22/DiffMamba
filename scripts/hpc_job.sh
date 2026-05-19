@@ -22,6 +22,7 @@
 #SBATCH --mem=64G
 
 set -euo pipefail
+USER="${USER:-$(whoami)}"
 
 SCRATCH="/scratch/${USER}"
 REPO="${HOME}/DiffMamba"
