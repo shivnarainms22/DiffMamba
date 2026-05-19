@@ -8,6 +8,17 @@ import rich.syntax
 import rich.tree
 import torch
 
+# PyTorch 2.6 changed weights_only default to True, which blocks Lightning's
+# internal torch.load calls that deserialise OmegaConf/typing objects stored
+# in Lightning checkpoints. Our ckpts are self-produced — safe to allow.
+_real_torch_load = torch.load
+
+def _torch_load_compat(*args, **kwargs):
+    kwargs.setdefault('weights_only', False)
+    return _real_torch_load(*args, **kwargs)
+
+torch.load = _torch_load_compat
+
 import dataloader
 import diffusion
 import utils
