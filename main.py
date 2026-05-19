@@ -19,6 +19,11 @@ def _torch_load_compat(*args, **kwargs):
 
 torch.load = _torch_load_compat
 
+# Enable TF32 for float32 matmuls on Ampere+ GPUs (A100, RTX 30xx+).
+# PyTorch disables this by default; 'high' trades negligible precision for
+# ~10-20% throughput gain on top of bf16 mixed precision.
+torch.set_float32_matmul_precision('high')
+
 import dataloader
 import diffusion
 import utils

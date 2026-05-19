@@ -21,7 +21,7 @@ trainer:
   max_steps: 76_000
   val_check_interval: 5000
   gradient_clip_val: 1.0
-  precision: 'bf16'
+  precision: 'bf16-mixed'
 
 loader:
   global_batch_size: 64

@@ -68,7 +68,7 @@ trainer:
   devices: ${device_count:}
   accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   gradient_clip_val: 1.0
-  precision: 'bf16'
+  precision: 'bf16-mixed'
   num_sanity_val_steps: 2
   # Plan-aligned: 76000 steps × 64 batch × 1024 seq ≈ 5B tokens (one OWT pass).
   max_steps: 76_000

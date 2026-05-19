@@ -14,7 +14,7 @@ mode: train
 trainer:
   max_steps: 30_000
   val_check_interval: 3000
-  precision: 'bf16'
+  precision: 'bf16-mixed'
 
 loader:
   global_batch_size: 64
