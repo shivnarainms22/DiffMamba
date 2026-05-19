@@ -23,6 +23,7 @@
 
 set -euo pipefail
 USER="${USER:-$(whoami)}"
+HOME="${HOME:-/home/${USER}}"
 
 SCRATCH="/scratch/${USER}"
 REPO="${HOME}/DiffMamba"
