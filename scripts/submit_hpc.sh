@@ -35,7 +35,7 @@ done
 JID=$(sbatch \
     --job-name="${RUN_NAME}" \
     --output="${LOG_DIR}/${RUN_NAME}_%j.log" \
-    --export=RUN_NAME="${RUN_NAME}",EXPERIMENT="${EXPERIMENT}",MAX_STEPS="${MAX_STEPS}",EXTRA_ARGS="${EXTRA_ARGS}" \
+    --export=ALL,RUN_NAME="${RUN_NAME}",EXPERIMENT="${EXPERIMENT}",MAX_STEPS="${MAX_STEPS}",EXTRA_ARGS="${EXTRA_ARGS}" \
     "${REPO}/scripts/hpc_job.sh" \
     | awk '{print $NF}')
 

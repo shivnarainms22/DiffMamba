@@ -93,7 +93,7 @@ NEXT_JID=$(sbatch \
     --dependency=afterany:"${SLURM_JOB_ID}" \
     --job-name="${RUN_NAME}" \
     --output="${LOG_DIR}/${RUN_NAME}_%j.log" \
-    --export=RUN_NAME="${RUN_NAME}",EXPERIMENT="${EXPERIMENT}",MAX_STEPS="${MAX_STEPS}",EXTRA_ARGS="${EXTRA_ARGS:-}" \
+    --export=ALL,RUN_NAME="${RUN_NAME}",EXPERIMENT="${EXPERIMENT}",MAX_STEPS="${MAX_STEPS}",EXTRA_ARGS="${EXTRA_ARGS:-}" \
     "${REPO}/scripts/hpc_job.sh" \
     | awk '{print $NF}')
 echo "Next segment queued as job ${NEXT_JID} (runs after this job completes)."
