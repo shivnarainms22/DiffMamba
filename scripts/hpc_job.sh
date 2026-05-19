@@ -40,7 +40,7 @@ echo
 
 # ---------- environment ----------
 
-module load anaconda3/2024.06 cuda/12.1.1
+module load anaconda3/2024.06 cuda/13.2.0
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate diffmamba
 

@@ -9,7 +9,7 @@
 #
 # For --build-cuda, first get an interactive GPU session:
 #   srun --partition=gpu-interactive --gres=gpu:a100:1 --time=2:00:00 --pty bash
-#   module load anaconda3/2024.06 cuda/12.1.1
+#   module load anaconda3/2024.06 cuda/13.2.0
 #   source activate diffmamba
 #   bash scripts/setup_hpc.sh --build-cuda
 
