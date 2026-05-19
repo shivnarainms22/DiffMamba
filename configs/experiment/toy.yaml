@@ -11,10 +11,16 @@
 
 defaults:
   - override /model: micro-dimamba
-  - override /data: openwebtext-streaming  # no on-disk preprocess needed for smoke
+  - override /data: wikitext2
 
 backbone: dimamba
 mode: train
+
+# wikitext2 is 12 MB — downloads in seconds, same GPT-2 tokenizer as OWT.
+# Overrides the lab-cluster cache_dir baked into data/wikitext2.yaml.
+data:
+  cache_dir: /tmp/wt2
+  streaming: false
 
 loader:
   global_batch_size: 8
