@@ -64,6 +64,14 @@ MAX_JOBS=4 pip install "mamba-ssm>=2.0.0" --no-build-isolation
 echo "  done."
 echo
 
+# flash-attn: required for runB (Transformer-MDLM). The DiT backbone calls
+# flash_attn_varlen_qkvpacked_func directly — no flash-attn = crash at step 0.
+# Installs from a pre-built wheel when one matches; falls back to source (~20 min).
+echo "--- Building flash-attn (≈5-20 min depending on wheel availability) ---"
+MAX_JOBS=4 pip install "flash-attn>=2.5.0" --no-build-isolation
+echo "  done."
+echo
+
 # ---------- import verification ----------
 
 echo "--- Verifying installs ---"
@@ -84,6 +92,7 @@ print(f"  lightning      {lightning.__version__}")
 print(f"  transformers   {transformers.__version__}")
 print(f"  datasets       {datasets.__version__}")
 print(f"  wandb          {wandb.__version__}")
+print(f"  flash-attn     {v('flash-attn')}")
 EOF
 
 echo
