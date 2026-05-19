@@ -42,9 +42,15 @@ if [[ -z "${HF_TOKEN:-}" && -n "${HF_HUB_REPO_ID:-}" ]]; then
     echo "WARNING: HF_TOKEN unset but HF_HUB_REPO_ID set — uploads will fail."
 fi
 
+# Dataset cache: openwebtext.yaml hardcodes a Cornell cluster path.
+# Override to pod volume (default /workspace/data; set DATA_CACHE_DIR to change).
+CACHE_DIR="${DATA_CACHE_DIR:-/workspace/data}"
+echo "Dataset cache: ${CACHE_DIR}"
+mkdir -p "${CACHE_DIR}"
+
 # PYTHONUNBUFFERED=1 + python -u → line-buffered output for live `tail -f`.
 # `tee` keeps a copy in the file even if the session is killed.
-CMD="PYTHONUNBUFFERED=1 python -u main.py +experiment=${EXPERIMENT} $* 2>&1 | tee ${LOG}"
+CMD="PYTHONUNBUFFERED=1 python -u main.py +experiment=${EXPERIMENT} data.cache_dir=${CACHE_DIR} $* 2>&1 | tee ${LOG}"
 
 tmux new-session -d -s "$SESSION" "$CMD"
 echo
