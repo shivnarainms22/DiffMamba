@@ -42,6 +42,16 @@ echo
 
 # ---------- environment ----------
 
+# Initialize module system (not active in SLURM batch env by default)
+for _mod_init in \
+    /usr/share/lmod/lmod/init/bash \
+    /etc/profile.d/modules.sh \
+    /usr/share/Modules/init/bash \
+    /opt/apps/lmod/lmod/init/bash; do
+    [[ -f "$_mod_init" ]] && { source "$_mod_init"; break; }
+done
+unset _mod_init
+
 module load anaconda3/2024.06 cuda/13.2.0
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate diffmamba
