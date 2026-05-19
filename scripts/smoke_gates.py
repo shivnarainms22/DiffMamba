@@ -149,25 +149,16 @@ def check_ckpt_loads(ctx):
     import dataloader
     import omegaconf
 
-    # PyTorch 2.6+ defaults weights_only=True; allowlist OmegaConf types
-    # stored in Lightning hyper_parameters so load_from_checkpoint succeeds.
-    try:
-        torch.serialization.add_safe_globals([
-            omegaconf.DictConfig,
-            omegaconf.ListConfig,
-            omegaconf.base.ContainerMetadata,
-        ])
-    except AttributeError:
-        pass  # PyTorch < 2.6
-
+    # Use weights_only=False directly — Lightning's load_from_checkpoint
+    # serialises arbitrary OmegaConf / typing internals that would require
+    # an unbounded safe_globals allowlist under PyTorch 2.6+.
     ckpt = torch.load(ctx['ckpt'], map_location='cpu', weights_only=False)
     config = ckpt['hyper_parameters']['config']
     if isinstance(config, dict):
         config = omegaconf.OmegaConf.create(config)
     tokenizer = dataloader.get_tokenizer(config)
-    model = diffusion.Diffusion.load_from_checkpoint(
-        ctx['ckpt'], tokenizer=tokenizer, config=config,
-        map_location='cuda')
+    model = diffusion.Diffusion(config, tokenizer=tokenizer)
+    model.load_state_dict(ckpt['state_dict'])
     model.eval().cuda()
     ids = torch.full((1, 256), model.mask_index,
                      dtype=torch.long, device='cuda')

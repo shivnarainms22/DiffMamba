@@ -61,7 +61,7 @@ def run_training(steps, run_dir, resume_from=None):
         # Tiny model + tiny batch + zero workers — keep verification fast.
         'loader.global_batch_size=4',
         'loader.num_workers=0',
-        'trainer.val_check_interval=999999',  # don't validate during this test
+        'trainer.limit_val_batches=0.0',  # disable validation entirely for this test
         'trainer.num_sanity_val_steps=0',
         # Save every 10 steps so the first run produces a ckpt fast.
         'callbacks.checkpoint_every_n_steps.every_n_train_steps=10',
