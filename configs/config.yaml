@@ -78,6 +78,7 @@ trainer:
   val_check_interval: 5000
 
 wandb:
+  entity: shivnarainms22-northeastern-university
   project: text-diffusion
   notes: Mulan for text
   group: null
