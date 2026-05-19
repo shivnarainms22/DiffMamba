@@ -63,6 +63,7 @@ def load_model(ckpt_path: str, backbone: str):
         torch.serialization.add_safe_globals([
             omegaconf.DictConfig,
             omegaconf.ListConfig,
+            omegaconf.base.ContainerMetadata,
         ])
     except AttributeError:
         pass  # PyTorch < 2.6

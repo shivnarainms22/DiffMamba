@@ -576,7 +576,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
       shuffle=not config.data.streaming,
-      persistent_workers=True)
+      persistent_workers=config.loader.num_workers > 0)
     train_loader.tokenizer = tokenizer
   if skip_valid:
     valid_loader = None

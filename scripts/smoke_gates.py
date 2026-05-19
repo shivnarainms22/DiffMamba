@@ -155,6 +155,7 @@ def check_ckpt_loads(ctx):
         torch.serialization.add_safe_globals([
             omegaconf.DictConfig,
             omegaconf.ListConfig,
+            omegaconf.base.ContainerMetadata,
         ])
     except AttributeError:
         pass  # PyTorch < 2.6
