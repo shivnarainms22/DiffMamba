@@ -67,13 +67,23 @@ export PATH="${HOME}/.conda/envs/diffmamba/bin:${PATH}"
 #   --no-cache-dir + --no-binary :all: : compile from SOURCE, never reuse a
 #                       cached wheel (a cached wheel built against the wrong
 #                       CUDA/torch is exactly what keeps the broken .so around)
+# causal-conv1d + mamba-ssm: needed by all dimamba (BiMamba) runs.
 python -c "import mamba_ssm" 2>/dev/null || {
-    echo "mamba_ssm not importable — compiling CUDA extensions from source (~15 min)..."
+    echo "mamba_ssm not importable — compiling from source (~10 min)..."
     MAX_JOBS=4 pip install "causal-conv1d>=1.4.0" --force-reinstall --no-deps --no-build-isolation --no-cache-dir --no-binary :all: -q
     MAX_JOBS=4 pip install "mamba-ssm>=2.0.0" --force-reinstall --no-deps --no-build-isolation --no-cache-dir --no-binary :all: -q
-    MAX_JOBS=4 pip install "flash-attn>=2.5.0" --force-reinstall --no-deps --no-build-isolation --no-cache-dir --no-binary :all: -q
-    echo "  CUDA extensions built."
+    echo "  mamba_ssm built."
 }
+
+# flash-attn: only the Transformer backbone (runB) calls it at runtime.
+# Gate on experiment name so BiMamba runs don't waste ~20 min building it.
+if [[ "${EXPERIMENT}" == *transformer* ]]; then
+    python -c "import flash_attn" 2>/dev/null || {
+        echo "flash_attn not importable — compiling from source (~15-20 min)..."
+        MAX_JOBS=4 pip install "flash-attn>=2.5.0" --force-reinstall --no-deps --no-build-isolation --no-cache-dir --no-binary :all: -q
+        echo "  flash_attn built."
+    }
+fi
 
 export WANDB_DIR="${SCRATCH}/wandb"
 mkdir -p "${WANDB_DIR}" "${SCRATCH}/data"
