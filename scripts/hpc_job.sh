@@ -61,12 +61,13 @@ conda activate diffmamba
 # even after conda activate. This makes the right interpreter explicit.
 export PATH="${HOME}/.conda/envs/diffmamba/bin:${PATH}"
 
-# Build CUDA extensions if not already installed (first job only, ~15 min).
+# Build CUDA extensions if not importable. --force-reinstall ensures a broken
+# .so (e.g. compiled against wrong PyTorch) is recompiled, not skipped by pip.
 python -c "import mamba_ssm" 2>/dev/null || {
-    echo "mamba_ssm not found — building CUDA extensions (one-time, ~15 min)..."
-    MAX_JOBS=4 pip install "causal-conv1d>=1.4.0" --no-build-isolation -q
-    MAX_JOBS=4 pip install "mamba-ssm>=2.0.0" --no-build-isolation -q
-    MAX_JOBS=4 pip install "flash-attn>=2.5.0" --no-build-isolation -q
+    echo "mamba_ssm not importable — force-rebuilding CUDA extensions (~15 min)..."
+    MAX_JOBS=4 pip install "causal-conv1d>=1.4.0" --force-reinstall --no-build-isolation -q
+    MAX_JOBS=4 pip install "mamba-ssm>=2.0.0" --force-reinstall --no-build-isolation -q
+    MAX_JOBS=4 pip install "flash-attn>=2.5.0" --force-reinstall --no-build-isolation -q
     echo "  CUDA extensions built."
 }
 
