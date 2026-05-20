@@ -70,12 +70,14 @@ if [[ "$BUILD_CUDA" == "--build-cuda" ]]; then
         echo "Loading cuda/12.8.0 for nvcc (matches cu128 torch + driver)..."
         module load cuda/12.8.0
     fi
+    # --no-cache-dir --no-binary :all: forces a source compile against the
+    # installed torch — never reuse a cached wheel built for a different CUDA.
     echo "Building causal-conv1d (≈2 min)..."
-    MAX_JOBS=4 pip install "causal-conv1d>=1.4.0" --no-build-isolation
+    MAX_JOBS=4 pip install "causal-conv1d>=1.4.0" --no-deps --no-build-isolation --no-cache-dir --no-binary :all:
     echo "Building mamba-ssm (≈5 min)..."
-    MAX_JOBS=4 pip install "mamba-ssm>=2.0.0" --no-build-isolation
+    MAX_JOBS=4 pip install "mamba-ssm>=2.0.0" --no-deps --no-build-isolation --no-cache-dir --no-binary :all:
     echo "Building flash-attn (≈5-20 min)..."
-    MAX_JOBS=4 pip install "flash-attn>=2.5.0" --no-build-isolation
+    MAX_JOBS=4 pip install "flash-attn>=2.5.0" --no-deps --no-build-isolation --no-cache-dir --no-binary :all:
     echo "  CUDA extensions built."
 else
     echo "Skipping CUDA extension builds (login node has no GPU)."

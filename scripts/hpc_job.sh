@@ -61,14 +61,17 @@ conda activate diffmamba
 # even after conda activate. This makes the right interpreter explicit.
 export PATH="${HOME}/.conda/envs/diffmamba/bin:${PATH}"
 
-# Build CUDA extensions if not importable. --force-reinstall recompiles a
-# broken .so (compiled against the wrong PyTorch); --no-deps ensures torch is
-# NOT swapped out underneath us (which is what breaks the .so in the first place).
+# Build CUDA extensions if not importable. Flags explained:
+#   --force-reinstall : recompile a broken .so instead of skipping
+#   --no-deps         : do NOT swap torch out from under the build
+#   --no-cache-dir + --no-binary :all: : compile from SOURCE, never reuse a
+#                       cached wheel (a cached wheel built against the wrong
+#                       CUDA/torch is exactly what keeps the broken .so around)
 python -c "import mamba_ssm" 2>/dev/null || {
-    echo "mamba_ssm not importable — force-rebuilding CUDA extensions (~15 min)..."
-    MAX_JOBS=4 pip install "causal-conv1d>=1.4.0" --force-reinstall --no-deps --no-build-isolation -q
-    MAX_JOBS=4 pip install "mamba-ssm>=2.0.0" --force-reinstall --no-deps --no-build-isolation -q
-    MAX_JOBS=4 pip install "flash-attn>=2.5.0" --force-reinstall --no-deps --no-build-isolation -q
+    echo "mamba_ssm not importable — compiling CUDA extensions from source (~15 min)..."
+    MAX_JOBS=4 pip install "causal-conv1d>=1.4.0" --force-reinstall --no-deps --no-build-isolation --no-cache-dir --no-binary :all: -q
+    MAX_JOBS=4 pip install "mamba-ssm>=2.0.0" --force-reinstall --no-deps --no-build-isolation --no-cache-dir --no-binary :all: -q
+    MAX_JOBS=4 pip install "flash-attn>=2.5.0" --force-reinstall --no-deps --no-build-isolation --no-cache-dir --no-binary :all: -q
     echo "  CUDA extensions built."
 }
 
