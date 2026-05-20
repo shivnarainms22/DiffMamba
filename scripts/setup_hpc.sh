@@ -50,6 +50,7 @@ pip install -q \
     "rich>=13.0" \
     "fsspec>=2024.2" \
     "einops>=0.7" \
+    "timm>=0.9" \
     "packaging" \
     "ninja" \
     "pytest>=8.0"
