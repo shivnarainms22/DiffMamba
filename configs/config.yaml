@@ -52,7 +52,11 @@ eval:
   perplexity_batch_size: 8
   compute_perplexity_on_sanity: False
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
-  generate_samples: True
+  # Disabled for training: the ddpm-cache sampler builds a [eval_batch, seq, vocab]
+  # categorical (~12GB at batch 64) and OOMs the validation step on 40GB A100 nodes.
+  # Validation NLL/perplexity (the headline metric) still logs via validation_step.
+  # Generate qualitative samples post-hoc from checkpoints with mode=sample_eval.
+  generate_samples: False
 
 optim:
   weight_decay: 0.01  # Plan-aligned (MDLM paper: AdamW wd=0.01).
