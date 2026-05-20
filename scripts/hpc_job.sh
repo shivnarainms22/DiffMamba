@@ -88,6 +88,9 @@ fi
 export WANDB_DIR="${SCRATCH}/wandb"
 mkdir -p "${WANDB_DIR}" "${SCRATCH}/data"
 
+# Reduce CUDA memory fragmentation (recommended in the OOM error message).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # ---------- early exit if already done ----------
 
 if [[ -f "${CKPT}" ]]; then

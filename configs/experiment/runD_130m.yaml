@@ -25,6 +25,13 @@ trainer:
 
 loader:
   global_batch_size: 64
+  # Per-GPU micro-batch. global_batch_size/devices=64 OOMs an 80GB A100 for
+  # the 130M model, so cap micro-batch and let accumulate_grad_batches (=4)
+  # rebuild the global batch of 64 — identical training dynamics.
+  batch_size: 16
+
+wandb:
+  name: runD_130m
 
 optim:
   lr: 3e-4

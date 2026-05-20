@@ -19,6 +19,11 @@ trainer:
 
 loader:
   global_batch_size: 64
+  # Cap per-GPU micro-batch; accumulate_grad_batches (=4) rebuilds global 64.
+  batch_size: 16
+
+wandb:
+  name: runB_130m
 
 optim:
   lr: 3e-4
