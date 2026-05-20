@@ -35,10 +35,12 @@ fi
 
 conda activate diffmamba
 
-# ---------- PyTorch (CUDA 12.1 wheels) ----------
+# ---------- PyTorch (CUDA 12.8 wheels) ----------
+# Explorer GPU nodes run NVIDIA driver 570.x (max CUDA 12.8). torch MUST be a
+# cu12x build — a cu130 build will load but torch.cuda.is_available() is False.
 
 echo "Installing PyTorch + standard dependencies..."
-pip install -q torch --index-url https://download.pytorch.org/whl/cu121
+pip install -q torch --index-url https://download.pytorch.org/whl/cu128
 pip install -q \
     "lightning>=2.0" \
     "hydra-core>=1.3" \
@@ -65,8 +67,8 @@ echo
 
 if [[ "$BUILD_CUDA" == "--build-cuda" ]]; then
     if ! command -v nvcc &>/dev/null; then
-        echo "Loading cuda/12.1.1 for nvcc..."
-        module load cuda/12.1.1
+        echo "Loading cuda/12.8.0 for nvcc (matches cu128 torch + driver)..."
+        module load cuda/12.8.0
     fi
     echo "Building causal-conv1d (≈2 min)..."
     MAX_JOBS=4 pip install "causal-conv1d>=1.4.0" --no-build-isolation

@@ -52,7 +52,7 @@ for _mod_init in \
 done
 unset _mod_init
 
-module load anaconda3/2024.06 cuda/13.2.0
+module load anaconda3/2024.06 cuda/12.8.0
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate diffmamba
 
