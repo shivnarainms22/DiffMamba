@@ -40,7 +40,9 @@ conda activate diffmamba
 # cu12x build — a cu130 build will load but torch.cuda.is_available() is False.
 
 echo "Installing PyTorch + standard dependencies..."
-pip install -q torch --index-url https://download.pytorch.org/whl/cu128
+# Install torch + torchvision together so their versions stay paired — a
+# mismatched torchvision breaks `import torchmetrics` (pulled in by lightning).
+pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cu128
 pip install -q \
     "lightning>=2.0" \
     "hydra-core>=1.3" \
