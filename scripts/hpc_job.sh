@@ -56,6 +56,11 @@ module load anaconda3/2024.06 cuda/13.2.0
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate diffmamba
 
+# Force diffmamba's Python to the front of PATH.
+# module load anaconda prepends base conda, which can shadow diffmamba
+# even after conda activate. This makes the right interpreter explicit.
+export PATH="${HOME}/.conda/envs/diffmamba/bin:${PATH}"
+
 # Build CUDA extensions if not already installed (first job only, ~15 min).
 python -c "import mamba_ssm" 2>/dev/null || {
     echo "mamba_ssm not found — building CUDA extensions (one-time, ~15 min)..."
