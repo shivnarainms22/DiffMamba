@@ -14,7 +14,10 @@ import torch
 _real_torch_load = torch.load
 
 def _torch_load_compat(*args, **kwargs):
-    kwargs.setdefault('weights_only', False)
+    # Force weights_only=False: Lightning passes weights_only=True explicitly
+    # when resuming, so setdefault would be ignored and the OmegaConf DictConfig
+    # in the checkpoint would fail to unpickle. Our checkpoints are self-produced.
+    kwargs['weights_only'] = False
     return _real_torch_load(*args, **kwargs)
 
 torch.load = _torch_load_compat
