@@ -41,6 +41,7 @@ Thumbs.db
 # Plan / doc artifacts (kept out of the repo per project policy)
 *.pdf
 docs/
-# README lives locally only — repo front page intentionally left blank.
-/README.md
+# Markdown notes are local-only, except the surfaced README + project report.
 *.md
+!README.md
+!DiffMamba_Report.md
