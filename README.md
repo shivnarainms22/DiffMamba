@@ -31,23 +31,38 @@ all experiments here are mine. See **Attribution & Related Work** below.
 
 ## Headline results
 
-Validation perplexity (lower is better), matched 130M parameters / ~5B tokens:
+**Quality** — Validation perplexity (lower is better), 130M parameters / ~5B tokens:
 
-| Model | Backbone | Params | Val PPL ↓ |
-|-------|----------|--------|-----------|
-| Transformer (DiT) | attention | 130M | **70.5** |
-| BiMamba-2 (2 seeds) | SSM | 130M | ~84.7 |
+| Model | Backbone | Params | LR | Val PPL ↓ |
+|-------|----------|--------|----|-----------|
+| Transformer (DiT) | attention | 130M | 3e-4 | **70.5** |
+| BiMamba-2 (2 seeds) | SSM | 130M | 3e-4 | ~84.7 |
+| **BiMamba-2 (LR-tuned)** | **SSM** | **130M** | **1e-3** | **79.3** |
 
-BiMamba scaling (Val PPL): **50M → 136.3, 100M → 97.5, 130M → 84.7** (clean,
-monotonic). Seed-stable (Δ≈2.4 between seeds).
+BiMamba scaling (lr=3e-4 Val PPL): **50M → 136.3, 100M → 97.5, 130M → 84.7** —
+clean, monotonic, seed-stable (Δ≈2.4 between seeds). A learning-rate sweep at
+50M (§6.5) showed BiMamba prefers a **~3.3× higher LR** than the MDLM default;
+retraining at 130M with the tuned LR (§6.6) closes **~43% of the gap** to the
+Transformer (15.5 → 8.8 ppl) but does **not** close it.
+
+**Throughput** — forward-pass benchmark, 130M-class denoisers on A100 (§6.7):
+
+| seq_len | BiMamba ms | DiT ms | Speedup |
+|--------:|-----------:|-------:|--------:|
+|    1024 |       29.1 |   17.2 | 0.59× (DiT faster) |
+|    4096 |       45.9 |   55.0 | 1.20× ← crossover |
+|   32768 |      364.0 | 1136.2 | **3.12×** |
+
+BiMamba latency is **textbook-linear** in seq length; DiT is empirically
+O(L^1.55) even with FlashAttention. Crossover ~3K tokens.
 
 **Honest finding:** at matched compute with the MDLM (Transformer-tuned) recipe,
-the Transformer denoiser is modestly but consistently stronger on quality; the
-*pure* BiMamba-2 trails — consistent with the prior work below, where a *hybrid*
-Mamba+attention model is what recovers quality. The motivating advantage of the
-SSM backbone is inference efficiency at long context (see the report). Full
-numbers, caveats, and the in-progress LR-fairness sweep are in the
-[report](./DiffMamba_Report.md).
+the Transformer denoiser is modestly but consistently stronger on quality —
+even after retuning BiMamba's learning rate, the gap narrows but does not close.
+The *pure* BiMamba-2 trails on quality, but is **~3× faster** at long context.
+This is consistent with the prior work below, where a *hybrid* Mamba+attention
+model is what recovers quality. Full numbers, caveats, and the LR-fairness
+analysis are in the [report](./DiffMamba_Report.md).
 
 ---
 
