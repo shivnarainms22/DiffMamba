@@ -4,9 +4,8 @@
 # frozen, train only the MLP projector on image-caption pairs (LLaVA-Pretrain).
 # Warm-start the backbone from the DiffMamba 130M checkpoint.
 #
-# Usage (on a GPU node):
-#   python main_vlm.py +experiment=vlm_stage1_align mode=vlm_train \
-#     vlm.warmstart_path=/scratch/.../runD_130m_lr1e3_seed1/checkpoints/best.ckpt
+# Usage (on a GPU node) — warmstart_path defaults to runD_lr1e3/best.ckpt:
+#   python main_vlm.py +experiment=vlm_stage1_align mode=vlm_train
 
 defaults:
   - /vlm: siglip_base

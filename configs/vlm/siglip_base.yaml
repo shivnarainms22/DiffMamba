@@ -8,7 +8,8 @@ vlm:
   num_image_tokens: 196    # (224/16)^2 patch tokens (clean prefix length)
   projector_hidden: 2048   # MLP projector hidden dim
   phase: align             # align (projector-only) | sft (full fine-tune)
-  warmstart_path: ''       # DiffMamba runD_130m_lr1e3_seed1 best.ckpt
+  # DiffMamba 130M lr=1e-3 backbone (Val PPL 79.3) — the warm-start asset.
+  warmstart_path: /scratch/sarin.s/DiffMamba/runs/runD_lr1e3/checkpoints/best.ckpt
   text_len: 256            # text positions; image prefix is separate
   align_dataset: liuhaotian/LLaVA-Pretrain
   sft_dataset: liuhaotian/LLaVA-Instruct-150K
