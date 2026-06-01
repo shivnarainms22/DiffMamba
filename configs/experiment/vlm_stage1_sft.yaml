@@ -1,0 +1,40 @@
+# @package _global_
+#
+# VLM Stage 1 — Phase 2 (instruction fine-tune). Full FT: SigLIP stays frozen,
+# unfreeze the Mamba backbone + projector, train on LLaVA-Instruct-150K.
+# Warm-start the projector (and backbone) from the Phase-1 alignment checkpoint.
+#
+# Usage (on a GPU node):
+#   python main_vlm.py +experiment=vlm_stage1_sft mode=vlm_train \
+#     vlm.warmstart_path=/scratch/.../runs/vlm_align/checkpoints/best.ckpt
+
+defaults:
+  - /vlm: siglip_base
+  - override /model: small-dimamba
+  - override /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor, sigterm_save]
+
+backbone: dimamba
+parameterization: subs
+mode: vlm_train
+
+vlm:
+  phase: sft
+
+# 30000 is a multiple of the 2000-step checkpoint interval.
+trainer:
+  max_steps: 30_000
+  val_check_interval: 2000
+  gradient_clip_val: 1.0
+  precision: 'bf16-mixed'
+
+loader:
+  global_batch_size: 64
+  batch_size: 16
+
+# Lower LR for full fine-tune than the projector-only align phase.
+optim:
+  lr: 2e-4
+  weight_decay: 0.01
+
+wandb:
+  name: vlm_sft

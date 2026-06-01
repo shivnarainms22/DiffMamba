@@ -1,0 +1,15 @@
+# @package _global_
+#
+# Vision config group for the Stage-1 understanding VLM (image -> text).
+# Merged at root via `# @package _global_`; experiment files override `phase`.
+vlm:
+  encoder_name: google/siglip-base-patch16-224
+  vision_dim: 768          # SigLIP base hidden size
+  num_image_tokens: 196    # (224/16)^2 patch tokens (clean prefix length)
+  projector_hidden: 2048   # MLP projector hidden dim
+  phase: align             # align (projector-only) | sft (full fine-tune)
+  warmstart_path: ''       # DiffMamba runD_130m_lr1e3_seed1 best.ckpt
+  text_len: 256            # text positions; image prefix is separate
+  align_dataset: liuhaotian/LLaVA-Pretrain
+  sft_dataset: liuhaotian/LLaVA-Instruct-150K
+  max_examples: null       # cap dataset size for smoke/debug; null = full
