@@ -56,4 +56,7 @@ class MMDiMamba(nn.Module):
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             logits = model(inputs_embeds=fused, time_embeds=c).logits
 
-        return slice_text_logits(logits, self.num_image_tokens)
+        # .contiguous(): slicing returns a view, but the SUBS parameterization
+        # writes into the logits in-place — an in-place op on a view is an
+        # autograd hazard at backward. Return a fresh, owned tensor.
+        return slice_text_logits(logits, self.num_image_tokens).contiguous()
