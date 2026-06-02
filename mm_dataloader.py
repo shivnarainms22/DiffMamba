@@ -65,17 +65,28 @@ def _first_caption(value):
     return value
 
 
-def _load_records(name, split, n, streaming):
-    """Load up to n records from an HF dataset (streaming keeps the smoke cheap)."""
+def _load_records(name, split, n, streaming, label_field=None):
+    """Load up to n records from an HF dataset (streaming keeps the smoke cheap).
+
+    Returns (records, label_names). label_names is the ClassLabel name list when
+    label_field is given (so an image-classification set can stand in as a
+    caption source: caption = class name), else None.
+    """
     from datasets import load_dataset
     ds = load_dataset(name, split=split, streaming=streaming)
+    label_names = None
+    if label_field is not None:
+        feat = ds.features.get(label_field) if ds.features else None
+        label_names = getattr(feat, 'names', None)
     if streaming:
         if n:
             ds = ds.take(n)
-        return list(ds)
-    if n:
-        ds = ds.select(range(min(n, len(ds))))
-    return list(ds)
+        records = list(ds)
+    else:
+        if n:
+            ds = ds.select(range(min(n, len(ds))))
+        records = list(ds)
+    return records, label_names
 
 
 @torch.no_grad()
@@ -98,7 +109,7 @@ class MMDataset(torch.utils.data.Dataset):
     """Map-style dataset over precomputed image features + caption text."""
 
     def __init__(self, records, image_features, tokenizer, caption_prompt,
-                 text_len, caption_column):
+                 text_len, caption_column, label_names=None):
         assert len(records) == len(image_features)
         self.records = records
         self.image_features = image_features
@@ -106,12 +117,17 @@ class MMDataset(torch.utils.data.Dataset):
         self.caption_prompt = caption_prompt
         self.text_len = text_len
         self.caption_column = caption_column
+        self.label_names = label_names
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, i):
-        caption = _first_caption(self.records[i][self.caption_column])
+        raw = self.records[i][self.caption_column]
+        if self.label_names is not None:   # classification label -> class name
+            caption = self.label_names[int(raw)]
+        else:
+            caption = _first_caption(raw)
         tl = build_prompt_labels(
             self.tokenizer, self.caption_prompt, caption, self.text_len)
         return {
@@ -141,7 +157,9 @@ def get_mm_dataloaders(config, tokenizer):
 
     n = v.get('max_examples', None)
     streaming = v.get('streaming', True)
-    records = _load_records(v.dataset, v.split, n, streaming)
+    label_field = v.caption_column if v.get('label_as_caption', False) else None
+    records, label_names = _load_records(
+        v.dataset, v.split, n, streaming, label_field)
     if not records:
         raise ValueError(f'No records loaded from {v.dataset}:{v.split}')
     feats = _precompute_features(records, v.image_column, processor, tower,
@@ -154,9 +172,10 @@ def get_mm_dataloaders(config, tokenizer):
 
     n_valid = max(2, len(records) // 10)
     train_ds = MMDataset(records, feats, tokenizer, v.caption_prompt,
-                         v.text_len, v.caption_column)
+                         v.text_len, v.caption_column, label_names)
     valid_ds = MMDataset(records[:n_valid], feats[:n_valid], tokenizer,
-                         v.caption_prompt, v.text_len, v.caption_column)
+                         v.caption_prompt, v.text_len, v.caption_column,
+                         label_names)
 
     num_workers = config.loader.num_workers
     train_loader = torch.utils.data.DataLoader(
