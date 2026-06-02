@@ -1,0 +1,39 @@
+# @package _global_
+#
+# VLM Stage 1 — pipeline smoke test. Tiny streamed image-caption slice, few
+# steps, warm-started 130M backbone (projector-only align). Proves the
+# end-to-end training step runs and loss is finite/decreasing — NOT a real run.
+#
+# Usage (GPU node):
+#   python main_vlm.py +experiment=vlm_smoke
+
+defaults:
+  - /vlm: siglip_base
+  - override /model: small-dimamba
+  - override /callbacks: [checkpoint_every_n_steps, learning_rate_monitor]
+
+backbone: dimamba
+parameterization: subs
+mode: vlm_train
+
+vlm:
+  phase: align
+  max_examples: 64
+  text_len: 64
+
+trainer:
+  max_steps: 50
+  val_check_interval: 50
+  precision: 'bf16-mixed'
+  num_sanity_val_steps: 0
+  limit_val_batches: 1
+
+loader:
+  global_batch_size: 2
+  batch_size: 2
+  num_workers: 0
+
+optim:
+  lr: 1e-3
+
+wandb: null

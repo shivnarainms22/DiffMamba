@@ -1,10 +1,17 @@
 """
-mm_dataloader.py — text template utilities for masked-diffusion VLM training.
+mm_dataloader.py — data pipeline for the masked-diffusion understanding VLM.
 
-Currently contains only build_prompt_labels (Task 4).
-MMDataset and get_mm_dataloaders will be added in Task 5.
+- build_prompt_labels: pure text-template builder (CPU-testable).
+- MMDataset / get_mm_dataloaders: a *generic* image-caption loader. It reads any
+  HF dataset that exposes an inline image column and a caption column (configured
+  via vlm.image_column / vlm.caption_column), precomputes frozen SigLIP features
+  once (kept out of the training graph and out of checkpoints), and yields
+  {input_ids, attention_mask, loss_mask, image_features} batches.
 """
+import itertools
 from typing import Dict, List
+
+import torch
 
 
 def build_prompt_labels(tokenizer, prompt: str, answer: str,
@@ -49,3 +56,117 @@ def build_prompt_labels(tokenizer, prompt: str, answer: str,
     loss += [0]   * pad_n
 
     return {"input_ids": ids, "attention_mask": attn, "loss_mask": loss}
+
+
+def _first_caption(value):
+    """Datasets store captions as either a str or a list[str]; take one str."""
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else ''
+    return value
+
+
+def _load_records(name, split, n, streaming):
+    """Load up to n records from an HF dataset (streaming keeps the smoke cheap)."""
+    from datasets import load_dataset
+    ds = load_dataset(name, split=split, streaming=streaming)
+    if streaming:
+        if n:
+            ds = ds.take(n)
+        return list(ds)
+    if n:
+        ds = ds.select(range(min(n, len(ds))))
+    return list(ds)
+
+
+@torch.no_grad()
+def _precompute_features(records, image_column, processor, tower, device,
+                         batch_size=16):
+    """Run the frozen SigLIP tower over all images once → (N, num_img, dim) cpu."""
+    tower = tower.to(device).eval()
+    out = []
+    for start in range(0, len(records), batch_size):
+        chunk = records[start:start + batch_size]
+        imgs = [r[image_column].convert('RGB') for r in chunk]
+        pixel_values = processor(
+            images=imgs, return_tensors='pt')['pixel_values'].to(device)
+        feats = tower(pixel_values)
+        out.append(feats.float().cpu())
+    return torch.cat(out, dim=0)
+
+
+class MMDataset(torch.utils.data.Dataset):
+    """Map-style dataset over precomputed image features + caption text."""
+
+    def __init__(self, records, image_features, tokenizer, caption_prompt,
+                 text_len, caption_column):
+        assert len(records) == len(image_features)
+        self.records = records
+        self.image_features = image_features
+        self.tokenizer = tokenizer
+        self.caption_prompt = caption_prompt
+        self.text_len = text_len
+        self.caption_column = caption_column
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, i):
+        caption = _first_caption(self.records[i][self.caption_column])
+        tl = build_prompt_labels(
+            self.tokenizer, self.caption_prompt, caption, self.text_len)
+        return {
+            'input_ids': torch.tensor(tl['input_ids'], dtype=torch.long),
+            'attention_mask': torch.tensor(tl['attention_mask'],
+                                           dtype=torch.float),
+            'loss_mask': torch.tensor(tl['loss_mask'], dtype=torch.float),
+            'image_features': self.image_features[i],
+        }
+
+
+def get_mm_dataloaders(config, tokenizer):
+    """Build train/valid loaders. Precomputes SigLIP features up front; the
+    vision tower is freed before training so it never enters the train graph."""
+    from transformers import AutoImageProcessor
+
+    from models.vision import SiglipVisionTower
+
+    v = config.vlm
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    processor = AutoImageProcessor.from_pretrained(v.encoder_name)
+    tower = SiglipVisionTower(v.encoder_name)
+    assert tower.num_image_tokens == v.num_image_tokens, (
+        f'config.vlm.num_image_tokens={v.num_image_tokens} != '
+        f'tower={tower.num_image_tokens}')
+
+    n = v.get('max_examples', None)
+    streaming = v.get('streaming', True)
+    records = _load_records(v.dataset, v.split, n, streaming)
+    if not records:
+        raise ValueError(f'No records loaded from {v.dataset}:{v.split}')
+    feats = _precompute_features(records, v.image_column, processor, tower,
+                                 device)
+
+    # Free the tower — features are cached; it is not needed during training.
+    del tower
+    if device == 'cuda':
+        torch.cuda.empty_cache()
+
+    n_valid = max(2, len(records) // 10)
+    train_ds = MMDataset(records, feats, tokenizer, v.caption_prompt,
+                         v.text_len, v.caption_column)
+    valid_ds = MMDataset(records[:n_valid], feats[:n_valid], tokenizer,
+                         v.caption_prompt, v.text_len, v.caption_column)
+
+    num_workers = config.loader.num_workers
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=config.loader.batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=config.loader.pin_memory,
+        persistent_workers=num_workers > 0)
+    valid_loader = torch.utils.data.DataLoader(
+        valid_ds, batch_size=config.loader.eval_batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=config.loader.pin_memory,
+        persistent_workers=num_workers > 0)
+    train_loader.tokenizer = tokenizer
+    valid_loader.tokenizer = tokenizer
+    return train_loader, valid_loader
