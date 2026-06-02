@@ -18,7 +18,7 @@ import torch
 
 import models
 import utils
-from diffusion import Diffusion, Loss
+from diffusion import Diffusion, Loss, _sample_categorical
 from models.mm_dimamba import MMDiMamba
 from warmstart import load_warmstart
 
@@ -143,6 +143,62 @@ class MMDiffusion(Diffusion):
 
         self.log_dict(metrics, on_step=False, on_epoch=True, sync_dist=True)
         return loss
+
+    def _ddpm_update_cond(self, x, t, dt, image_features):
+        """Image-conditioned DDPM denoising step (parent _ddpm_update + image)."""
+        sigma_t, _ = self.noise(t)
+        sigma_s, _ = self.noise(t - dt)
+        if sigma_t.ndim > 1:
+            sigma_t = sigma_t.squeeze(-1)
+        if sigma_s.ndim > 1:
+            sigma_s = sigma_s.squeeze(-1)
+        move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
+        move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
+
+        log_p_x0 = self.forward(x, sigma_t, image_features)
+        q_xs = log_p_x0.exp() * (move_chance_t - move_chance_s)
+        q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+        x_next = _sample_categorical(q_xs)
+
+        # Keep already-revealed tokens (prompt + previously unmasked answer).
+        copy_flag = (x != self.mask_index).to(x.dtype)
+        return copy_flag * x + (1 - copy_flag) * x_next
+
+    @torch.no_grad()
+    def _sample_conditional(self, image_features, prompt_ids, num_steps=None,
+                            eps=1e-5, return_trajectory=False):
+        """Generate the answer span given an image + clean prompt by iterative
+        unmasking. prompt_ids: (B, P) clean conditioning tokens kept fixed.
+        Returns (B, text_len) token ids (and the per-step trajectory if asked —
+        used for the denoising-unmask visualization)."""
+        if num_steps is None:
+            num_steps = self.config.sampling.steps
+        device = image_features.device
+        B = image_features.shape[0]
+        L = self.config.vlm.text_len
+        P = prompt_ids.shape[1]
+
+        x = torch.full((B, L), self.mask_index, dtype=torch.long, device=device)
+        x[:, :P] = prompt_ids
+
+        timesteps = torch.linspace(1, eps, num_steps + 1, device=device)
+        dt = (1 - eps) / num_steps
+        trajectory = [x.clone()] if return_trajectory else None
+
+        for i in range(num_steps):
+            t = timesteps[i] * torch.ones(B, 1, device=device)
+            x = self._ddpm_update_cond(x, t, dt, image_features)
+            x[:, :P] = prompt_ids                      # hold the prompt fixed
+            if return_trajectory:
+                trajectory.append(x.clone())
+
+        if self.config.sampling.noise_removal:
+            t = timesteps[-1] * torch.ones(B, 1, device=device)
+            sigma = self.noise(t)[0]
+            x = self.forward(x, sigma, image_features).argmax(dim=-1)
+            x[:, :P] = prompt_ids
+
+        return (x, trajectory) if return_trajectory else x
 
     def configure_optimizers(self):
         # Only optimize trainable params (phase freezing zeros requires_grad on

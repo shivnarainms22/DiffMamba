@@ -83,7 +83,31 @@ def _vlm_train(config, logger, tokenizer):
 
 
 def _vlm_sample(config, logger, tokenizer):
-    raise NotImplementedError('mode=vlm_sample is implemented in Task 12.')
+    logger.info('Generating image -> text samples.')
+    model = MMDiffusion.load_from_checkpoint(
+        config.eval.checkpoint_path, tokenizer=tokenizer, config=config).to('cuda')
+    if config.eval.disable_ema:
+        model.ema = None
+    elif model.ema is not None:
+        import itertools
+        model.ema.move_shadow_params_to_device(model.device)
+        model.ema.copy_to(itertools.chain(model.backbone.parameters(),
+                                          model.noise.parameters()))
+    model.eval()
+
+    _, valid_ds = mm_dataloader.get_mm_dataloaders(config, tokenizer)
+    batch = next(iter(valid_ds))
+    image_features = batch['image_features'].to('cuda')
+
+    prompt = [tokenizer.bos_token_id] + tokenizer.encode(
+        config.vlm.caption_prompt, add_special_tokens=False)
+    prompt_ids = torch.tensor(prompt, device='cuda')[None].repeat(
+        image_features.shape[0], 1)
+
+    out = model._sample_conditional(
+        image_features, prompt_ids, num_steps=config.sampling.steps)
+    for i, text in enumerate(tokenizer.batch_decode(out)):
+        print(f'[sample {i}] {text}')
 
 
 @hydra.main(version_base=None, config_path='configs', config_name='config')

@@ -28,6 +28,7 @@ _TINY = [
     'model.hidden_size=256', 'model.n_blocks=4', 'model.cond_dim=128',
     'model.length=64',
     'vlm.num_image_tokens=5', 'vlm.vision_dim=64', 'vlm.projector_hidden=128',
+    'vlm.text_len=16',
     'vlm.warmstart_path=',          # no warm-start in the unit test
 ]
 
@@ -103,3 +104,34 @@ def test_ema_shadow_matches_trainable_params_align():
     # update() must not raise (the size-mismatch bug surfaced here).
     model.ema.update(itertools.chain(model.backbone.parameters(),
                                      model.noise.parameters()))
+
+
+def test_conditional_sample_shape_and_prompt_preserved():
+    model = _build('align')
+    B, N, Dv, P = 2, 5, 64, 4
+    feats = torch.randn(B, N, Dv, device='cuda')
+    prompt_ids = torch.randint(0, 50256, (B, P), device='cuda')
+
+    out = model._sample_conditional(feats, prompt_ids, num_steps=8)
+    assert out.shape == (B, model.config.vlm.text_len)
+    assert out.dtype == torch.long
+    assert (out < model.vocab_size).all(), 'out-of-vocab token sampled'
+    # Prompt is held fixed across the whole denoising trajectory.
+    assert torch.equal(out[:, :P], prompt_ids), 'prompt was not preserved'
+    # noise_removal fills every remaining position — no [MASK] should survive.
+    assert (out != model.mask_index).all(), 'mask token survived sampling'
+
+
+def test_conditional_sample_trajectory_unmasks_progressively():
+    model = _build('align')
+    B, N, Dv, P = 1, 5, 64, 4
+    feats = torch.randn(B, N, Dv, device='cuda')
+    prompt_ids = torch.randint(0, 50256, (B, P), device='cuda')
+
+    out, traj = model._sample_conditional(
+        feats, prompt_ids, num_steps=8, return_trajectory=True)
+    assert len(traj) == 8 + 1               # initial + one per step
+    # The first state has the answer span fully masked; the final fewer masks.
+    masks_first = (traj[0] == model.mask_index).sum().item()
+    masks_last = (traj[-1] == model.mask_index).sum().item()
+    assert masks_first > masks_last, 'unmasking did not progress'
