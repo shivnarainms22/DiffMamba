@@ -97,6 +97,9 @@ def test_ema_shadow_matches_trainable_params_align():
                                             model.noise.parameters())
                  if p.requires_grad]
     assert len(model.ema.shadow_params) == len(trainable)
+    # Mirror Diffusion.on_train_start (shadows are cloned on CPU at __init__,
+    # then moved to the model's device before the first optimizer step).
+    model.ema.move_shadow_params_to_device('cuda')
     # update() must not raise (the size-mismatch bug surfaced here).
     model.ema.update(itertools.chain(model.backbone.parameters(),
                                      model.noise.parameters()))
