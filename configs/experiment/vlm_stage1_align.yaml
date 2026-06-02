@@ -1,11 +1,10 @@
 # @package _global_
 #
 # VLM Stage 1 — Phase 1 (alignment). Projector-only: SigLIP + Mamba backbone
-# frozen, train only the MLP projector on image-caption pairs (LLaVA-Pretrain).
-# Warm-start the backbone from the DiffMamba 130M checkpoint.
+# frozen, train only the MLP projector on image-caption pairs (CC3M).
+# Backbone warm-started from the DiffMamba 130M checkpoint (siglip_base default).
 #
-# Usage (on a GPU node) — warmstart_path defaults to runD_lr1e3/best.ckpt:
-#   python main_vlm.py +experiment=vlm_stage1_align mode=vlm_train
+# Usage (GPU node): python main_vlm.py +experiment=vlm_stage1_align
 
 defaults:
   - /vlm: siglip_base
@@ -18,11 +17,26 @@ mode: vlm_train
 
 vlm:
   phase: align
+  dataset: pixparse/cc3m-wds
+  split: train
+  image_column: jpg
+  caption_column: txt
+  question_column: null
+  label_as_caption: false
+  caption_prompt: "Describe the image."
+  streaming: true
+  max_examples: 80000
+  text_len: 64
 
-# 20000 is a multiple of the 2000-step checkpoint interval (avoids the s100
-# non-aligned-target retrain loop).
+data:
+  cache_dir: /scratch/sarin.s/data
+
+checkpointing:
+  save_dir: /scratch/sarin.s/DiffMamba/runs/vlm_align
+
+# 6000 is a multiple of the 2000-step checkpoint interval.
 trainer:
-  max_steps: 20_000
+  max_steps: 6000
   val_check_interval: 2000
   gradient_clip_val: 1.0
   precision: 'bf16-mixed'

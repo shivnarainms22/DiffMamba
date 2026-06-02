@@ -8,9 +8,12 @@ mm_dataloader.py — data pipeline for the masked-diffusion understanding VLM.
   once (kept out of the training graph and out of checkpoints), and yields
   {input_ids, attention_mask, loss_mask, image_features} batches.
 """
-import itertools
+import hashlib
+import json
+import os
 from typing import Dict, List
 
+import numpy as np
 import torch
 
 
@@ -58,90 +61,146 @@ def build_prompt_labels(tokenizer, prompt: str, answer: str,
     return {"input_ids": ids, "attention_mask": attn, "loss_mask": loss}
 
 
-def _first_caption(value):
-    """Datasets store captions as either a str or a list[str]; take one str."""
+def _first_str(value):
+    """Datasets store target text as either a str or a list[str]; take one str."""
     if isinstance(value, (list, tuple)):
-        return value[0] if value else ''
-    return value
+        return str(value[0]) if value else ''
+    return str(value)
 
 
-def _load_records(name, split, n, streaming, label_field=None):
-    """Load up to n records from an HF dataset (streaming keeps the smoke cheap).
+def _resolve_prompt_answer(rec, v, label_names):
+    """Map one raw record to (prompt, answer) text given the column config.
 
-    Returns (records, label_names). label_names is the ClassLabel name list when
-    label_field is given (so an image-classification set can stand in as a
-    caption source: caption = class name), else None.
+    - label_as_caption: answer = class name for the int label; prompt fixed.
+    - question_column set (VQA): prompt = the question; answer = target text.
+    - else (captioning): prompt = fixed caption_prompt; answer = caption text.
     """
-    from datasets import load_dataset
-    ds = load_dataset(name, split=split, streaming=streaming)
-    label_names = None
-    if label_field is not None:
-        feat = ds.features.get(label_field) if ds.features else None
-        label_names = getattr(feat, 'names', None)
-    if streaming:
-        if n:
-            ds = ds.take(n)
-        records = list(ds)
-    else:
-        if n:
-            ds = ds.select(range(min(n, len(ds))))
-        records = list(ds)
-    return records, label_names
+    if label_names is not None:
+        return v.caption_prompt, str(label_names[int(rec[v.caption_column])])
+    answer = _first_str(rec[v.caption_column])
+    q_col = v.get('question_column', None)
+    if q_col:
+        return _first_str(rec[q_col]), answer
+    return v.caption_prompt, answer
+
+
+def _cache_key(v):
+    raw = f'{v.dataset}|{v.split}|{v.get("max_examples", None)}|{v.encoder_name}'
+    return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 
 @torch.no_grad()
-def _precompute_features(records, image_column, processor, tower, device,
-                         batch_size=16):
-    """Run the frozen SigLIP tower over all images once → (N, num_img, dim) cpu."""
+def _build_or_load_cache(v, cache_dir, processor, tower, device,
+                         num_img, vis_dim, batch_size=32):
+    """Stream the dataset once: encode images → float16 memmap on disk, collect
+    (prompt, answer) text. Reuses an existing cache (critical so chained 8h job
+    segments don't re-encode). Returns (feat_path, shape, text_records)."""
+    os.makedirs(cache_dir, exist_ok=True)
+    key = _cache_key(v)
+    feat_path = os.path.join(cache_dir, f'{key}.f16.dat')
+    text_path = os.path.join(cache_dir, f'{key}.text.json')
+    meta_path = os.path.join(cache_dir, f'{key}.meta.json')
+
+    if all(os.path.exists(p) for p in (feat_path, text_path, meta_path)):
+        meta = json.load(open(meta_path))
+        text_records = json.load(open(text_path))
+        return feat_path, tuple(meta['shape']), text_records
+
+    n = v.get('max_examples', None)
+    if not n:
+        raise ValueError(
+            'vlm.max_examples must be set for the memmap feature cache '
+            '(streaming has no length to size the memmap).')
+
+    from datasets import load_dataset
+    ds = load_dataset(v.dataset, split=v.split, streaming=True)
+    label_names = None
+    if v.get('label_as_caption', False):
+        feat = ds.features.get(v.caption_column) if ds.features else None
+        label_names = getattr(feat, 'names', None)
+    ds = ds.take(n)
+
     tower = tower.to(device).eval()
-    out = []
-    for start in range(0, len(records), batch_size):
-        chunk = records[start:start + batch_size]
-        imgs = [r[image_column].convert('RGB') for r in chunk]
+    mm = np.memmap(feat_path, dtype='float16', mode='w+',
+                   shape=(n, num_img, vis_dim))
+    text_records = []
+    img_buf, idx = [], 0
+
+    def _flush():
+        nonlocal idx
+        if not img_buf:
+            return
         pixel_values = processor(
-            images=imgs, return_tensors='pt')['pixel_values'].to(device)
-        feats = tower(pixel_values)
-        out.append(feats.float().cpu())
-    return torch.cat(out, dim=0)
+            images=img_buf, return_tensors='pt')['pixel_values'].to(device)
+        feats = tower(pixel_values).float().cpu().numpy().astype('float16')
+        mm[idx:idx + feats.shape[0]] = feats
+        idx += feats.shape[0]
+        img_buf.clear()
+
+    for rec in ds:
+        prompt, answer = _resolve_prompt_answer(rec, v, label_names)
+        text_records.append({'prompt': prompt, 'answer': answer})
+        img_buf.append(rec[v.image_column].convert('RGB'))
+        if len(img_buf) == batch_size:
+            _flush()
+    _flush()
+
+    count = idx
+    mm.flush()
+    del mm
+    # Trim to the actual count (streamed set may be < n).
+    shape = (count, num_img, vis_dim)
+    text_records = text_records[:count]
+    json.dump(text_records, open(text_path, 'w'))
+    json.dump({'shape': list(shape)}, open(meta_path, 'w'))
+    return feat_path, shape, text_records
 
 
 class MMDataset(torch.utils.data.Dataset):
-    """Map-style dataset over precomputed image features + caption text."""
+    """Map-style dataset over a disk feature memmap + (prompt, answer) text.
 
-    def __init__(self, records, image_features, tokenizer, caption_prompt,
-                 text_len, caption_column, label_names=None):
-        assert len(records) == len(image_features)
-        self.records = records
-        self.image_features = image_features
+    The memmap is opened lazily (per worker process) to avoid pickling it across
+    DataLoader workers. `index_offset` maps local indices into the shared memmap
+    so a contiguous train/valid split reuses one cache file.
+    """
+
+    def __init__(self, text_records, feat_path, feat_shape, tokenizer, text_len,
+                 index_offset=0):
+        self.text_records = text_records
+        self.feat_path = feat_path
+        self.feat_shape = feat_shape
         self.tokenizer = tokenizer
-        self.caption_prompt = caption_prompt
         self.text_len = text_len
-        self.caption_column = caption_column
-        self.label_names = label_names
+        self.index_offset = index_offset
+        self._mm = None
+
+    def _feats(self):
+        if self._mm is None:
+            self._mm = np.memmap(self.feat_path, dtype='float16', mode='r',
+                                 shape=self.feat_shape)
+        return self._mm
 
     def __len__(self):
-        return len(self.records)
+        return len(self.text_records)
 
     def __getitem__(self, i):
-        raw = self.records[i][self.caption_column]
-        if self.label_names is not None:   # classification label -> class name
-            caption = self.label_names[int(raw)]
-        else:
-            caption = _first_caption(raw)
+        rec = self.text_records[i]
+        row = np.asarray(self._feats()[self.index_offset + i])
         tl = build_prompt_labels(
-            self.tokenizer, self.caption_prompt, caption, self.text_len)
+            self.tokenizer, rec['prompt'], rec['answer'], self.text_len)
         return {
             'input_ids': torch.tensor(tl['input_ids'], dtype=torch.long),
             'attention_mask': torch.tensor(tl['attention_mask'],
                                            dtype=torch.float),
             'loss_mask': torch.tensor(tl['loss_mask'], dtype=torch.float),
-            'image_features': self.image_features[i],
+            'image_features': torch.from_numpy(row).float(),
         }
 
 
 def get_mm_dataloaders(config, tokenizer):
-    """Build train/valid loaders. Precomputes SigLIP features up front; the
-    vision tower is freed before training so it never enters the train graph."""
+    """Build train/valid loaders backed by a disk-cached SigLIP feature memmap.
+    The vision tower is used only to build the cache, then freed — it never
+    enters the training graph or the checkpoint."""
     from transformers import AutoImageProcessor
 
     from models.vision import SiglipVisionTower
@@ -155,27 +214,25 @@ def get_mm_dataloaders(config, tokenizer):
         f'config.vlm.num_image_tokens={v.num_image_tokens} != '
         f'tower={tower.num_image_tokens}')
 
-    n = v.get('max_examples', None)
-    streaming = v.get('streaming', True)
-    label_field = v.caption_column if v.get('label_as_caption', False) else None
-    records, label_names = _load_records(
-        v.dataset, v.split, n, streaming, label_field)
-    if not records:
-        raise ValueError(f'No records loaded from {v.dataset}:{v.split}')
-    feats = _precompute_features(records, v.image_column, processor, tower,
-                                 device)
+    cache_dir = os.path.join(config.data.cache_dir, 'vlm_feats')
+    feat_path, shape, text_records = _build_or_load_cache(
+        v, cache_dir, processor, tower, device,
+        tower.num_image_tokens, tower.hidden_size)
 
-    # Free the tower — features are cached; it is not needed during training.
     del tower
     if device == 'cuda':
         torch.cuda.empty_cache()
 
-    n_valid = max(2, len(records) // 10)
-    train_ds = MMDataset(records, feats, tokenizer, v.caption_prompt,
-                         v.text_len, v.caption_column, label_names)
-    valid_ds = MMDataset(records[:n_valid], feats[:n_valid], tokenizer,
-                         v.caption_prompt, v.text_len, v.caption_column,
-                         label_names)
+    total = len(text_records)
+    if total == 0:
+        raise ValueError(f'No records cached from {v.dataset}:{v.split}')
+    n_valid = max(1, min(total // 10, 512))
+    n_train = total - n_valid
+
+    train_ds = MMDataset(text_records[:n_train], feat_path, shape, tokenizer,
+                         v.text_len, index_offset=0)
+    valid_ds = MMDataset(text_records[n_train:], feat_path, shape, tokenizer,
+                         v.text_len, index_offset=n_train)
 
     num_workers = config.loader.num_workers
     train_loader = torch.utils.data.DataLoader(

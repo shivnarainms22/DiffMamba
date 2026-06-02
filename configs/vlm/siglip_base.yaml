@@ -23,6 +23,7 @@ vlm:
   split: train
   image_column: img
   caption_column: label
+  question_column: null    # VQA: per-record prompt column (null => use caption_prompt)
   label_as_caption: true
   caption_prompt: "Describe the image."
   streaming: true

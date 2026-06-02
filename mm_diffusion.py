@@ -20,7 +20,7 @@ import models
 import utils
 from diffusion import Diffusion, Loss, _sample_categorical
 from models.mm_dimamba import MMDiMamba
-from warmstart import load_warmstart
+from warmstart import load_vlm_warmstart
 
 
 class MMDiffusion(Diffusion):
@@ -40,10 +40,11 @@ class MMDiffusion(Diffusion):
         # match directly; projector keys are newly initialized).
         warmstart_path = config.vlm.get('warmstart_path', '')
         if warmstart_path:
-            info = load_warmstart(self.backbone, warmstart_path)
+            info = load_vlm_warmstart(self, warmstart_path)
             assert info['unexpected'] == 0, (
-                f'warm-start key mismatch (unexpected={info["unexpected"]}, '
-                f'missing={info["missing"]}) — check the MMDiMamba nesting.')
+                f'warm-start key mismatch (mode={info["mode"]}, '
+                f'unexpected={info["unexpected"]}, missing={info["missing"]}) '
+                f'— check the checkpoint layout.')
 
         # Freeze BEFORE rebuilding EMA: ema.py keeps shadows only for
         # requires_grad params and update() re-filters the same way, so the EMA
