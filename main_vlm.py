@@ -84,16 +84,7 @@ def _vlm_train(config, logger, tokenizer):
 
 def _vlm_sample(config, logger, tokenizer):
     logger.info('Generating image -> text samples.')
-    model = MMDiffusion.load_from_checkpoint(
-        config.eval.checkpoint_path, tokenizer=tokenizer, config=config).to('cuda')
-    if config.eval.disable_ema:
-        model.ema = None
-    elif model.ema is not None:
-        import itertools
-        model.ema.move_shadow_params_to_device(model.device)
-        model.ema.copy_to(itertools.chain(model.backbone.parameters(),
-                                          model.noise.parameters()))
-    model.eval()
+    model = _load_eval_model(config, tokenizer)
 
     _, valid_ds = mm_dataloader.get_mm_dataloaders(config, tokenizer)
     batch = next(iter(valid_ds))
@@ -110,6 +101,69 @@ def _vlm_sample(config, logger, tokenizer):
         print(f'[sample {i}] {text}')
 
 
+def _load_eval_model(config, tokenizer):
+    model = MMDiffusion.load_from_checkpoint(
+        config.eval.checkpoint_path, tokenizer=tokenizer, config=config).to('cuda')
+    if config.eval.disable_ema:
+        model.ema = None
+    elif model.ema is not None:
+        import itertools
+        model.ema.move_shadow_params_to_device(model.device)
+        model.ema.copy_to(itertools.chain(model.backbone.parameters(),
+                                          model.noise.parameters()))
+    model.eval()
+    return model
+
+
+def _norm(s):
+    import re
+    return re.sub(r'[^a-z0-9 ]', '', s.lower()).strip()
+
+
+def _vlm_eval(config, logger, tokenizer):
+    """Held-out eval: generate an answer per real question and score against the
+    gold answer. exact = normalized first answer segment equals gold;
+    recall = gold string appears anywhere in the generated answer."""
+    import json
+    model = _load_eval_model(config, tokenizer)
+    _, valid_ds = mm_dataloader.get_mm_dataloaders(config, tokenizer)
+    ds = valid_ds.dataset            # MMDataset: holds prompt/answer text
+    n_eval = min(len(ds), int(config.eval.get('num_eval', 200)))
+    steps = config.sampling.steps
+
+    exact = recall = 0
+    rows = []
+    for i in range(n_eval):
+        rec = ds.text_records[i]
+        q, gold = rec['prompt'], rec['answer']
+        feats = ds[i]['image_features'][None].to('cuda')
+        p = [tokenizer.bos_token_id] + tokenizer.encode(
+            q, add_special_tokens=False)
+        prompt_ids = torch.tensor(p, device='cuda')[None]
+        out = model._sample_conditional(feats, prompt_ids, num_steps=steps)
+        ans_ids = out[0, len(p):].tolist()
+        if tokenizer.eos_token_id in ans_ids:
+            ans_ids = ans_ids[:ans_ids.index(tokenizer.eos_token_id)]
+        gen = tokenizer.decode(ans_ids).strip()
+
+        ng, ngold = _norm(gen), _norm(gold)
+        is_exact = bool(ngold) and (ng == ngold or ng.startswith(ngold + ' '))
+        is_recall = bool(ngold) and ngold in ng
+        exact += is_exact
+        recall += is_recall
+        rows.append({'question': q, 'gold': gold, 'generated': gen,
+                     'exact': is_exact, 'recall': is_recall})
+
+    out_path = os.path.join(config.checkpointing.save_dir, 'vlm_eval.json')
+    summary = {'n': n_eval, 'exact_match': exact / n_eval,
+               'gold_recall': recall / n_eval, 'sampling_steps': steps}
+    json.dump({'summary': summary, 'rows': rows}, open(out_path, 'w'), indent=2)
+    print(f'VLM eval ({n_eval} held-out VQAv2): '
+          f'exact-match={summary["exact_match"]:.3f}  '
+          f'gold-recall={summary["gold_recall"]:.3f}')
+    print(f'Per-example rows written to {out_path}')
+
+
 @hydra.main(version_base=None, config_path='configs', config_name='config')
 def main(config):
     L.seed_everything(config.seed)
@@ -118,6 +172,8 @@ def main(config):
 
     if config.mode == 'vlm_sample':
         _vlm_sample(config, logger, tokenizer)
+    elif config.mode == 'vlm_eval':
+        _vlm_eval(config, logger, tokenizer)
     else:
         _vlm_train(config, logger, tokenizer)
 
