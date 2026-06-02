@@ -24,19 +24,23 @@ def build_prompt_labels(tokenizer, prompt: str, answer: str,
     Args:
         tokenizer: any tokenizer with bos_token_id, eos_token_id, pad_token_id
                    and an encode(str, add_special_tokens=False) -> List[int] method.
-        prompt:    the conditioning text (question / caption instruction).
-        answer:    the supervised response — only these tokens are denoised.
+        prompt:    the conditioning text (question / caption instruction) — kept
+                   clean (never noised), like the image prefix.
+        answer:    the target response.
         text_len:  fixed sequence length; output lists are always this length.
 
     Returns:
         dict with keys:
           input_ids      — [BOS] + prompt + answer + [EOS], padded with pad_token_id.
-          attention_mask — 1 on real tokens (non-pad), 0 on pad.
-          loss_mask      — 1 on answer tokens and the final EOS, 0 elsewhere.
+          attention_mask — all 1s (the full text_len canvas is the generation target).
+          loss_mask      — 0 on [BOS]+prompt (conditioning), 1 on EVERYTHING after
+                           (answer + EOS + padding).
 
-    Truncation: if the raw sequence exceeds text_len, it is clipped to
-    text_len-1 tokens and a final EOS (loss_mask=1) is appended, so the
-    output is always exactly text_len tokens with a valid EOS at the end.
+    Why supervise the padding: at inference the whole post-prompt span is masked
+    and generated. Training only on answer+EOS (leaving pad clean/unsupervised)
+    creates a train/inference mismatch — the model never learns to emit EOS then
+    pad, so it fills every slot and rambles. Supervising answer+EOS+pad teaches
+    it to produce a short answer, terminate, and pad — which matches generation.
     """
     bos = tokenizer.bos_token_id
     eos = tokenizer.eos_token_id
@@ -45,18 +49,16 @@ def build_prompt_labels(tokenizer, prompt: str, answer: str,
     p_ids = tokenizer.encode(prompt, add_special_tokens=False)
     a_ids = tokenizer.encode(answer, add_special_tokens=False)
 
-    ids  = [bos] + p_ids + a_ids + [eos]
-    loss = [0]   + [0] * len(p_ids) + [1] * len(a_ids) + [1]
-
+    ids = [bos] + p_ids + a_ids + [eos]
     if len(ids) > text_len:           # truncate, always keep a final EOS
-        ids  = ids[:text_len - 1]  + [eos]
-        loss = loss[:text_len - 1] + [1]
+        ids = ids[:text_len - 1] + [eos]
+    ids += [pad] * (text_len - len(ids))
 
-    attn  = [1] * len(ids)
-    pad_n = text_len - len(ids)
-    ids  += [pad] * pad_n
-    attn += [0]   * pad_n
-    loss += [0]   * pad_n
+    # [BOS] + prompt are clean conditioning (loss 0); the rest is the generation
+    # target (answer + EOS + pad), all supervised.
+    prompt_end = min(1 + len(p_ids), text_len)
+    loss = [0] * prompt_end + [1] * (text_len - prompt_end)
+    attn = [1] * text_len
 
     return {"input_ids": ids, "attention_mask": attn, "loss_mask": loss}
 

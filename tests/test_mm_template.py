@@ -17,29 +17,31 @@ class _ToyTok:
         return [10 + (ord(w[0]) % 50) for w in s.split()]
 
 
-def test_loss_mask_covers_answer_not_prompt_or_pad():
+def test_loss_mask_covers_everything_after_prompt():
     tok = _ToyTok()
     out = build_prompt_labels(tok, prompt="describe the image",
                               answer="a cat", text_len=16)
     ids, attn, loss = out["input_ids"], out["attention_mask"], out["loss_mask"]
     assert len(ids) == len(attn) == len(loss) == 16
-    # BOS at 0, then prompt(3), then answer(2), then EOS, rest pad.
     assert ids[0] == tok.bos_token_id
-    # prompt positions (1..3) are NOT in loss; answer + EOS ARE.
-    assert loss[1] == 0 and loss[2] == 0 and loss[3] == 0
-    answer_start = 1 + 3
-    assert loss[answer_start] == 1 and loss[answer_start + 1] == 1   # "a cat"
-    assert loss[answer_start + 2] == 1                                # EOS
-    # padding: attn and loss both 0 at the tail.
-    assert attn[-1] == 0 and loss[-1] == 0
+    # BOS + 3 prompt tokens are clean conditioning -> loss 0.
+    assert loss[0] == 0 and loss[1] == 0 and loss[2] == 0 and loss[3] == 0
+    # Everything after the prompt (answer + EOS + pad) is supervised so the
+    # model learns to answer, terminate, then pad.
+    assert all(l == 1 for l in loss[4:])
+    # Full canvas is the generation target -> attention all ones.
+    assert all(a == 1 for a in attn)
+    # Trailing tokens are pad ids (but still supervised).
     assert ids[-1] == tok.pad_token_id
 
 
 def test_truncates_when_too_long():
     tok = _ToyTok()
-    out = build_prompt_labels(tok, prompt="a " * 30, answer="b " * 30, text_len=16)
+    out = build_prompt_labels(tok, prompt="describe", answer="b " * 30,
+                              text_len=16)
     assert len(out["input_ids"]) == 16
-    assert out["input_ids"][-1] in (tok.eos_token_id, tok.pad_token_id)
+    assert out["input_ids"][-1] == tok.eos_token_id          # EOS preserved
+    assert len(out["attention_mask"]) == len(out["loss_mask"]) == 16
 
 
 # ---------------------------------------------------------------------------
