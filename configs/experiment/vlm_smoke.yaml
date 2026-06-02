@@ -23,7 +23,9 @@ vlm:
 
 trainer:
   max_steps: 50
-  val_check_interval: 50
+  # Float => validate once per epoch (avoids the int>batches-per-epoch error on
+  # the tiny smoke set: 64 examples / batch 2 = 32 batches).
+  val_check_interval: 1.0
   precision: 'bf16-mixed'
   num_sanity_val_steps: 0
   limit_val_batches: 1
