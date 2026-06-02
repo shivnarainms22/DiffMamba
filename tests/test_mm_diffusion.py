@@ -6,6 +6,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import itertools
+
 import pytest
 import torch
 
@@ -84,3 +86,17 @@ def test_sft_phase_trains_backbone():
     assert any(p.requires_grad
                for p in model.backbone.backbone.parameters()), \
         'backbone must be trainable in sft phase'
+
+
+def test_ema_shadow_matches_trainable_params_align():
+    """Regression: EMA must be built AFTER phase-freeze, so its shadow set
+    matches the trainable params ema.update() filters to (else a frozen-backbone
+    shadow misaligns against the projector-only live params)."""
+    model = _build('align')
+    trainable = [p for p in itertools.chain(model.backbone.parameters(),
+                                            model.noise.parameters())
+                 if p.requires_grad]
+    assert len(model.ema.shadow_params) == len(trainable)
+    # update() must not raise (the size-mismatch bug surfaced here).
+    model.ema.update(itertools.chain(model.backbone.parameters(),
+                                     model.noise.parameters()))

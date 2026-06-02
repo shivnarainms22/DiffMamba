@@ -45,6 +45,13 @@ class MMDiffusion(Diffusion):
                 f'warm-start key mismatch (unexpected={info["unexpected"]}, '
                 f'missing={info["missing"]}) — check the MMDiMamba nesting.')
 
+        # Freeze BEFORE rebuilding EMA: ema.py keeps shadows only for
+        # requires_grad params and update() re-filters the same way, so the EMA
+        # must be built against the final trainable set. Building it before the
+        # freeze would shadow the (then-trainable) backbone, then update() would
+        # see only the projector → a positional shadow/param misalignment.
+        self._apply_phase_freeze(config.vlm.phase)
+
         # Rebuild EMA over the NEW backbone parameters (the parent built it over
         # the now-discarded text backbone).
         if self.config.training.ema > 0:
@@ -52,8 +59,6 @@ class MMDiffusion(Diffusion):
                 itertools.chain(self.backbone.parameters(),
                                 self.noise.parameters()),
                 decay=self.config.training.ema)
-
-        self._apply_phase_freeze(config.vlm.phase)
 
     def _apply_phase_freeze(self, phase):
         if phase == 'align':
