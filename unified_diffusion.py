@@ -66,6 +66,19 @@ class UnifiedDiffusion(Diffusion):
         if self.ema:
             self.ema.move_shadow_params_to_device(self.device)
 
+    # The parent's on_save/on_load_checkpoint poke a single train_dataloader's
+    # .sampler for fault-tolerant resume — which doesn't exist for a
+    # CombinedLoader (dict of loaders). We disabled that sampler in
+    # on_train_start, so just persist EMA; Lightning saves global_step, model,
+    # and optimizer state by default (enough for the chained-run early-exit).
+    def on_save_checkpoint(self, checkpoint):
+        if self.ema:
+            checkpoint['ema'] = self.ema.state_dict()
+
+    def on_load_checkpoint(self, checkpoint):
+        if self.ema and 'ema' in checkpoint:
+            self.ema.load_state_dict(checkpoint['ema'])
+
     def optimizer_step(self, *args, **kwargs):
         # Parent's EMA update iterates backbone+noise; include the projector.
         super(Diffusion, self).optimizer_step(*args, **kwargs)
