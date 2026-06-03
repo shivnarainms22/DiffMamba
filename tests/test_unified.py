@@ -26,7 +26,7 @@ _TINY = [
     'model.length=64',
     'vlm.codebook_size=64', 'vlm.vq_tokens=8', 'vlm.siglip_tokens=5',
     'vlm.vision_dim=64', 'vlm.caption_len=4', 'vlm.projector_hidden=128',
-    'vlm.warmstart_path=',
+    'vlm.warmstart_path=', 'vlm.projector_warmstart_path=',
 ]
 
 
