@@ -8,6 +8,7 @@ separate so the text-only DiffMamba entry (main.py) stays untouched.
   python main_vlm.py +experiment=vlm_stage1_align mode=vlm_sample \
     eval.checkpoint_path=.../checkpoints/best.ckpt         # (Task 12)
 """
+import itertools
 import os
 
 import fsspec
@@ -30,8 +31,10 @@ torch.load = _torch_load_compat
 torch.set_float32_matmul_precision('high')
 
 import dataloader
+import gen_dataloader
 import mm_dataloader
 import utils
+from gen_diffusion import GenDiffusion
 from mm_diffusion import MMDiffusion
 
 omegaconf.OmegaConf.register_new_resolver('cwd', os.getcwd)
@@ -164,6 +167,133 @@ def _vlm_eval(config, logger, tokenizer):
     print(f'Per-example rows written to {out_path}')
 
 
+def _gen_train(config, logger, tokenizer):
+    logger.info('Starting text->image generation training.')
+    wandb_logger = _build_logger(config)
+    if (config.checkpointing.resume_from_ckpt
+            and config.checkpointing.resume_ckpt_path is not None
+            and utils.fsspec_exists(config.checkpointing.resume_ckpt_path)):
+        ckpt_path = config.checkpointing.resume_ckpt_path
+    else:
+        ckpt_path = None
+
+    train_ds, valid_ds = gen_dataloader.get_gen_dataloaders(config, tokenizer)
+    model = GenDiffusion(config, tokenizer=tokenizer)
+
+    trainer = hydra.utils.instantiate(
+        config.trainer,
+        default_root_dir=os.getcwd(),
+        callbacks=_callbacks(config),
+        strategy=hydra.utils.instantiate(config.strategy),
+        logger=wandb_logger)
+    trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
+
+
+def _gen_build_prompts(captions, tokenizer, v):
+    """[BOS] caption(padded to caption_len) [BOI] — fixed length P for all rows."""
+    rows = []
+    for c in captions:
+        cap = tokenizer.encode(c, add_special_tokens=False)[:v.caption_len]
+        cap = cap + [tokenizer.pad_token_id] * (v.caption_len - len(cap))
+        rows.append([tokenizer.bos_token_id] + cap + [v.boi_id])
+    return torch.tensor(rows, device='cuda')
+
+
+def _gen_sample(config, logger, tokenizer):
+    logger.info('Generating images from captions.')
+    import numpy as np
+    from PIL import Image
+
+    from models.vq import VQTokenizer
+
+    model = GenDiffusion.load_from_checkpoint(
+        config.eval.checkpoint_path, tokenizer=tokenizer, config=config).to('cuda')
+    if not config.eval.disable_ema and model.ema is not None:
+        model.ema.move_shadow_params_to_device(model.device)
+        model.ema.copy_to(itertools.chain(model.backbone.parameters(),
+                                          model.noise.parameters()))
+    model.eval()
+
+    _, valid_ds = gen_dataloader.get_gen_dataloaders(config, tokenizer)
+    n = config.sampling.get('num_sample_log', 8)
+    captions = valid_ds.dataset.captions[:n]
+    prompt_ids = _gen_build_prompts(captions, tokenizer, config.vlm)
+    codes = model._sample_image(prompt_ids, num_steps=config.sampling.steps)
+
+    vq = VQTokenizer(config.vlm.vq_repo,
+                     subfolder=config.vlm.get('vq_subfolder', None)).to('cuda').eval()
+    imgs = vq.decode(codes)                              # (B,3,H,W) in [-1,1]
+    out_dir = os.path.join(config.checkpointing.save_dir, 'gen_samples')
+    os.makedirs(out_dir, exist_ok=True)
+    for i, (cap, img) in enumerate(zip(captions, imgs)):
+        arr = ((img.float() + 1) * 127.5).clamp(0, 255).byte()
+        arr = arr.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        Image.fromarray(arr).save(os.path.join(out_dir, f'sample_{i:02d}.png'))
+        print(f'[gen {i}] "{cap[:60]}" -> sample_{i:02d}.png')
+    print(f'Saved {len(captions)} images to {out_dir}')
+
+
+def _gen_generate_pils(model, vq, captions, tokenizer, config, batch_size=8):
+    import numpy as np
+    from PIL import Image
+    pil_imgs = []
+    for s in range(0, len(captions), batch_size):
+        prompt_ids = _gen_build_prompts(captions[s:s + batch_size], tokenizer,
+                                        config.vlm)
+        codes = model._sample_image(prompt_ids, num_steps=config.sampling.steps)
+        for img in vq.decode(codes):
+            arr = ((img.float() + 1) * 127.5).clamp(0, 255).byte()
+            pil_imgs.append(Image.fromarray(
+                arr.permute(1, 2, 0).cpu().numpy().astype(np.uint8)))
+    return pil_imgs
+
+
+def _gen_eval(config, logger, tokenizer):
+    """Held-out CLIP-score: cosine(CLIP image, CLIP caption). Compare matched
+    vs shuffled captions — matched > shuffled means images are text-conditioned."""
+    import json
+    from transformers import CLIPModel, CLIPProcessor
+
+    from models.vq import VQTokenizer
+
+    model = GenDiffusion.load_from_checkpoint(
+        config.eval.checkpoint_path, tokenizer=tokenizer, config=config).to('cuda')
+    if not config.eval.disable_ema and model.ema is not None:
+        model.ema.move_shadow_params_to_device(model.device)
+        model.ema.copy_to(itertools.chain(model.backbone.parameters(),
+                                          model.noise.parameters()))
+    model.eval()
+
+    _, valid_ds = gen_dataloader.get_gen_dataloaders(config, tokenizer)
+    n = min(len(valid_ds.dataset), int(config.eval.get('num_eval', 64)))
+    captions = valid_ds.dataset.captions[:n]
+
+    vq = VQTokenizer(config.vlm.vq_repo,
+                     subfolder=config.vlm.get('vq_subfolder', None)).to('cuda').eval()
+    pil_imgs = _gen_generate_pils(model, vq, captions, tokenizer, config)
+
+    clip = CLIPModel.from_pretrained('openai/clip-vit-base-patch32').to('cuda').eval()
+    proc = CLIPProcessor.from_pretrained('openai/clip-vit-base-patch32')
+    with torch.no_grad():
+        inputs = proc(text=captions, images=pil_imgs, return_tensors='pt',
+                      padding=True, truncation=True).to('cuda')
+        out = clip(**inputs)
+        ifeat = out.image_embeds / out.image_embeds.norm(dim=-1, keepdim=True)
+        tfeat = out.text_embeds / out.text_embeds.norm(dim=-1, keepdim=True)
+    matched = (ifeat * tfeat).sum(-1).mean().item()
+    mismatched = (ifeat * torch.roll(tfeat, 1, 0)).sum(-1).mean().item()
+
+    summary = {'n': n, 'clip_matched': matched,
+               'clip_mismatched_shuffled': mismatched,
+               'sampling_steps': config.sampling.steps}
+    out = os.path.join(config.checkpointing.save_dir, 'gen_eval.json')
+    json.dump(summary, open(out, 'w'), indent=2)
+    print(f'Gen CLIP-score (n={n}): matched={matched:.3f} vs '
+          f'shuffled={mismatched:.3f}  '
+          f'(matched>shuffled => images are caption-conditioned)')
+    print(f'Written {out}')
+
+
 @hydra.main(version_base=None, config_path='configs', config_name='config')
 def main(config):
     L.seed_everything(config.seed)
@@ -174,6 +304,12 @@ def main(config):
         _vlm_sample(config, logger, tokenizer)
     elif config.mode == 'vlm_eval':
         _vlm_eval(config, logger, tokenizer)
+    elif config.mode == 'gen_train':
+        _gen_train(config, logger, tokenizer)
+    elif config.mode == 'gen_sample':
+        _gen_sample(config, logger, tokenizer)
+    elif config.mode == 'gen_eval':
+        _gen_eval(config, logger, tokenizer)
     else:
         _vlm_train(config, logger, tokenizer)
 

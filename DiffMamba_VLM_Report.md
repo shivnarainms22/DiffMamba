@@ -1,9 +1,14 @@
-# DiffMamba-VLM: A Bidirectional-Mamba Masked-Diffusion Vision-Language Model (Stage 1)
+# DiffMamba-VLM: A Bidirectional-Mamba Masked-Diffusion Vision-Language Model
 
-**Status:** Stage-1 proof complete (image→text understanding). 2026-06-02.
+**Status:** Stage 1 (image→text understanding) **and** Stage 2 (text→image generation)
+proofs complete. 2026-06-03.
 **Scope:** A standout/differentiated portfolio piece — the point is *novelty + honest
 rigor*, not leaderboard accuracy. Built additively on top of
 [DiffMamba](./DiffMamba_Report.md); the text-only project is unchanged.
+
+The model both **understands** images (Stage 1: VQAv2 exact-match 0.29) and **generates**
+them (Stage 2: text-conditioned images, CLIP matched > shuffled) on one bidirectional-Mamba
+masked-diffusion backbone — a small-scale "MMaDA-with-Mamba." Stage 1 is §§1–6; Stage 2 is §8.
 
 ## 1. One-line contribution
 
@@ -107,17 +112,86 @@ DiT in throughput beyond ~3K tokens (3.1× at 32K). A VLM built on this backbone
 that long-context efficiency** — relevant as image-token counts and multi-image / video
 contexts grow. (Not separately benchmarked here; inherited from the backbone.)
 
-## 7. Conclusion & future work
+## 7. Stage 1 conclusion
 
 Stage 1 establishes that a **bidirectional-Mamba masked-diffusion VLM** trains and conditions
-on images end-to-end, reproducing the expected small-scale quality/throughput trade-off
-honestly. It is a working, novel artifact rather than a SOTA system — exactly the intended
-portfolio contribution.
+on images end-to-end (image→text understanding), reproducing the expected small-scale
+quality/throughput trade-off honestly.
 
-**Stage 2 (designed, not built):** text→image *generation* via a frozen VQ tokenizer +
-image-token vocabulary expansion in the same denoising framework → a unified
-understand-and-generate model. Other directions: scale data/steps, a hybrid Mamba+attention
-block to recover quality (per DiffuApriel), and an end-to-end generation-latency benchmark.
+## 8. Stage 2 — text→image generation
+
+Stage 2 extends the same backbone to **generate images from text**, then is the basis for a
+unified understand-and-generate model.
+
+### 8.1 Method
+
+Generation is **pure tokens in / tokens out** — sequence
+`[BOS] caption [BOI] <1024 VQ image tokens> [EOI]` — so it reuses the original text DiMamba
+path (no SigLIP, no projector) with an **expanded vocabulary**: text `[0..50256]` + `[MASK]` +
+`[BOI]`/`[EOI]` + **4096 VQ image-code tokens**. A frozen diffusers `VQModel`
+(`microsoft/vq-diffusion-ithq`, f8) maps 256px images ↔ a **32×32 = 1024** code grid. The
+backbone is warm-started from the text checkpoint `runD_lr1e3` (text embedding/lm_head rows
+copied; image/marker rows fresh). Conditional masking noises **only the image span** (caption
+clean); MDLM SUBS loss over image tokens. Sampling iteratively unmasks the 1024 image tokens
+with logits constrained to the image-code range, then `VQModel.decode` → pixels.
+
+**Why 1024 tokens:** it is the backbone's trained sequence length *and* it puts generation in
+the regime where Mamba's **linear** sequence scaling beats attention's quadratic — i.e., the
+SSM backbone is a natural fit for high-token-count image generation (a deliberate design
+choice; higher token counts are the documented scaling extension).
+
+### 8.2 Training
+
+Proof-run on Explorer (A100, chained 8h segments): **CC3M** caption→image
+(`pixparse/cc3m-wds`, ~80K subset), images VQ-encoded once to an int16 token memmap on
+`/scratch` (reused across segments). 8000 steps, warm-started from the 130M text backbone.
+
+### 8.3 Results
+
+**Held-out CLIP-score (n=64, generated image vs. caption):**
+
+| | CLIP cosine |
+|---|---|
+| matched (image vs. its own caption) | **0.191** |
+| shuffled (image vs. a random caption) | 0.182 |
+
+**matched > shuffled ⇒ the generated images are genuinely text-conditioned** — the model uses
+the caption. The gap is small and the absolute score modest (well-matched CLIP pairs score
+~0.25–0.30), i.e. **real but weak** conditioning, as expected at 130M proof scale.
+
+**Qualitative.** Generated images are **coherent, textured structure — not noise** — with loose
+caption alignment:
+
+| Caption | Sample |
+|---|---|
+| *"portrait of the artist by painting artist"* | ![portrait](assets/gen_sample_00_portrait.png) |
+| *"man concentrating on a chess game"* | ![chess](assets/gen_sample_01_chess.png) |
+
+The first is a warm, **painterly brush-textured** image (on-theme for "painting/artist"); the
+second is a dim **scene with figures**. Neither has recognizable objects (no face, no
+chessboard) — the honest 130M ceiling: structured, text-influenced, but rough.
+
+### 8.4 Stage 2 limitations
+
+- **Quality bounded by model size, not resolution.** At 130M, more image tokens give bigger
+  but still-rough images; recognizable objects need a much larger LM (LLaDA-V/MMaDA are 8B).
+- **Weak conditioning gap.** The CLIP matched−shuffled margin is small; classifier-free
+  guidance (caption dropout + guided sampling) is the documented lever to widen it.
+- **Proof-run scale & no FID.** ~80K CC3M, 8K steps; CLIP-score + qualitative only (FID needs
+  many samples + a reference set — future work).
+
+## 9. Overall conclusion & future work
+
+On one bidirectional-Mamba masked-diffusion backbone, the model both **understands** images
+(Stage 1: VQAv2 exact-match 0.29) and **generates** them (Stage 2: text-conditioned images,
+CLIP matched > shuffled) — a small-scale unified-capable "MMaDA-with-Mamba," novel because
+public diffusion-LM VLMs are Transformer-based. Both results are honest proofs of mechanism at
+130M, not SOTA systems — exactly the intended portfolio contribution.
+
+**Future work:** unify both directions in a single training run (mixed understanding +
+generation data); classifier-free guidance for stronger conditioning; scale data/steps;
+higher image-token counts to exploit Mamba's linear scaling (+ a generation-latency benchmark
+vs. attention); a hybrid Mamba+attention block to recover quality (per DiffuApriel).
 
 ## Reproduce
 
@@ -127,13 +201,22 @@ bash scripts/submit_vlm.sh vlm_align vlm_stage1_align 6000 wandb=null
 # (after align completes)
 bash scripts/submit_vlm.sh vlm_sft   vlm_stage1_sft   8000 wandb=null
 
-# Held-out eval + qualitative samples
+# Stage-1 held-out eval + qualitative samples
 python main_vlm.py +experiment=vlm_stage1_sft mode=vlm_eval \
   eval.checkpoint_path=/scratch/.../runs/vlm_sft/checkpoints/best.ckpt sampling.steps=64
 python main_vlm.py +experiment=vlm_stage1_sft mode=vlm_sample \
   eval.checkpoint_path=/scratch/.../runs/vlm_sft/checkpoints/best.ckpt \
   vlm.caption_prompt="What is in the image?"
+
+# Stage-2 text->image generation: train, CLIP-score, image gallery
+bash scripts/submit_vlm.sh gen_stage2 gen_stage2 8000 wandb=null
+python main_vlm.py +experiment=gen_stage2 mode=gen_eval \
+  eval.checkpoint_path=/scratch/.../runs/gen_stage2/checkpoints/best.ckpt sampling.steps=64
+python main_vlm.py +experiment=gen_stage2 mode=gen_sample \
+  eval.checkpoint_path=/scratch/.../runs/gen_stage2/checkpoints/best.ckpt sampling.steps=128
 ```
 
-Code: `models/vision.py`, `models/mm_dimamba.py`, `mm_diffusion.py`, `mm_dataloader.py`,
-`warmstart.py`, `main_vlm.py`, `configs/vlm/`, `configs/experiment/vlm_stage1_*.yaml`.
+Stage 1 code: `models/vision.py`, `models/mm_dimamba.py`, `mm_diffusion.py`,
+`mm_dataloader.py`, `warmstart.py`, `configs/experiment/vlm_stage1_*.yaml`.
+Stage 2 code: `models/vq.py`, `gen_diffusion.py`, `gen_dataloader.py`, `gen_vocab.py`,
+`configs/vlm/vqgen.yaml`, `configs/experiment/gen_stage2.yaml`. Shared: `main_vlm.py`.
