@@ -39,3 +39,6 @@ vlm:
 
   # warm-start the text rows from the DiffMamba text backbone
   warmstart_path: /scratch/sarin.s/DiffMamba/runs/runD_lr1e3/checkpoints/best.ckpt
+  # warm-start the projector from the trained Stage-1 (vlm_sft) projector so the
+  # backbone never learns to ignore a random image prefix (avoids the collapse)
+  projector_warmstart_path: /scratch/sarin.s/DiffMamba/runs/vlm_sft/checkpoints/best.ckpt

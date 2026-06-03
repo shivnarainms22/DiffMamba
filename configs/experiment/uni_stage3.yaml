@@ -20,9 +20,10 @@ data:
 checkpointing:
   save_dir: /scratch/sarin.s/DiffMamba/runs/uni_stage3
 
-# 8000 is a multiple of the 2000-step checkpoint interval.
+# 12000 (mult of the 2000-step ckpt interval) — recovery: warm-started projector
+# + more joint steps to overcome the cold-start collapse.
 trainer:
-  max_steps: 8000
+  max_steps: 12000
   val_check_interval: 2000
   gradient_clip_val: 1.0
   precision: 'bf16-mixed'

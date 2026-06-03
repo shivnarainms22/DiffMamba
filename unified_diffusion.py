@@ -19,7 +19,7 @@ from diffusion import Diffusion, Loss, _sample_categorical
 from models.dimamba import DiMamba
 from models.mm_ops import assemble_mm_embeds, slice_text_logits
 from models.vision import MLPProjector
-from warmstart import load_text_rows_into_expanded
+from warmstart import load_projector_from_mm, load_text_rows_into_expanded
 
 
 class UnifiedDiffusion(Diffusion):
@@ -52,6 +52,13 @@ class UnifiedDiffusion(Diffusion):
         if ws:
             info = load_text_rows_into_expanded(self.backbone, ws, base_vocab)
             assert info['unexpected'] == 0 and info['vocab_rows_copied'] >= 1, info
+
+        # Warm-start the projector from the trained Stage-1 projector so the
+        # backbone doesn't learn to ignore a random image prefix (the collapse).
+        pws = v.get('projector_warmstart_path', '')
+        if pws:
+            pinfo = load_projector_from_mm(self.projector, pws)
+            assert pinfo['loaded'] > 0 and pinfo['unexpected'] == 0, pinfo
 
         if self.config.training.ema > 0:
             self.ema = models.ema.ExponentialMovingAverage(

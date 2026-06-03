@@ -109,3 +109,16 @@ def load_text_rows_into_expanded(dimamba, ckpt_path: str, base_vocab: int) -> di
             vocab_copied += 1
     missing, unexpected = dimamba.load_state_dict(load_dict, strict=False)
     return {'vocab_rows_copied': vocab_copied, 'unexpected': len(unexpected)}
+
+
+def load_projector_from_mm(projector, mm_ckpt_path: str) -> dict:
+    """Warm-start a projector from a Stage-1 MMDiffusion checkpoint (its trained
+    projector lives under 'backbone.projector.*'). Avoids the random-projector
+    cold start that makes the backbone learn to ignore the image."""
+    ckpt = torch.load(mm_ckpt_path, map_location='cpu', weights_only=False)
+    state = ckpt.get('state_dict', ckpt)
+    prefix = 'backbone.projector.'
+    sub = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+    missing, unexpected = projector.load_state_dict(sub, strict=False)
+    return {'loaded': len(sub), 'missing': len(missing),
+            'unexpected': len(unexpected)}
