@@ -374,6 +374,13 @@ def _uni_eval(config, logger, tokenizer):
     u_matched = (ge * go).sum(-1).mean().item()
     u_shuffled = (ge * torch.roll(go, 1, 0)).sum(-1).mean().item()
 
+    # --- DIAGNOSTIC: are generated captions actually varying per image? ---
+    print('--- DEBUG: first 5 (generated | gold) captions ---')
+    for gc, gd in list(zip(gen_caps, gold_caps))[:5]:
+        print(f'  GEN : {gc[:70]!r}')
+        print(f'  GOLD: {gd[:70]!r}')
+    print(f'  unique generated captions: {len(set(gen_caps))} / {len(gen_caps)}')
+
     # --- generation: caption -> image, CLIP(image, caption) ---
     caps = g_ds.captions[:n]
     vq = VQTokenizer(v.vq_repo, subfolder=v.get('vq_subfolder', None)).to('cuda').eval()
