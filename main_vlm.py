@@ -30,8 +30,10 @@ torch.load = _torch_load_compat
 torch.set_float32_matmul_precision('high')
 
 import dataloader
+import gen_dataloader
 import mm_dataloader
 import utils
+from gen_diffusion import GenDiffusion
 from mm_diffusion import MMDiffusion
 
 omegaconf.OmegaConf.register_new_resolver('cwd', os.getcwd)
@@ -164,6 +166,72 @@ def _vlm_eval(config, logger, tokenizer):
     print(f'Per-example rows written to {out_path}')
 
 
+def _gen_train(config, logger, tokenizer):
+    logger.info('Starting text->image generation training.')
+    wandb_logger = _build_logger(config)
+    if (config.checkpointing.resume_from_ckpt
+            and config.checkpointing.resume_ckpt_path is not None
+            and utils.fsspec_exists(config.checkpointing.resume_ckpt_path)):
+        ckpt_path = config.checkpointing.resume_ckpt_path
+    else:
+        ckpt_path = None
+
+    train_ds, valid_ds = gen_dataloader.get_gen_dataloaders(config, tokenizer)
+    model = GenDiffusion(config, tokenizer=tokenizer)
+
+    trainer = hydra.utils.instantiate(
+        config.trainer,
+        default_root_dir=os.getcwd(),
+        callbacks=_callbacks(config),
+        strategy=hydra.utils.instantiate(config.strategy),
+        logger=wandb_logger)
+    trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
+
+
+def _gen_build_prompts(captions, tokenizer, v):
+    """[BOS] caption(padded to caption_len) [BOI] — fixed length P for all rows."""
+    rows = []
+    for c in captions:
+        cap = tokenizer.encode(c, add_special_tokens=False)[:v.caption_len]
+        cap = cap + [tokenizer.pad_token_id] * (v.caption_len - len(cap))
+        rows.append([tokenizer.bos_token_id] + cap + [v.boi_id])
+    return torch.tensor(rows, device='cuda')
+
+
+def _gen_sample(config, logger, tokenizer):
+    logger.info('Generating images from captions.')
+    import numpy as np
+    from PIL import Image
+
+    from models.vq import VQTokenizer
+
+    model = GenDiffusion.load_from_checkpoint(
+        config.eval.checkpoint_path, tokenizer=tokenizer, config=config).to('cuda')
+    if not config.eval.disable_ema and model.ema is not None:
+        model.ema.move_shadow_params_to_device(model.device)
+        model.ema.copy_to(itertools.chain(model.backbone.parameters(),
+                                          model.noise.parameters()))
+    model.eval()
+
+    _, valid_ds = gen_dataloader.get_gen_dataloaders(config, tokenizer)
+    n = config.sampling.get('num_sample_log', 8)
+    captions = valid_ds.dataset.captions[:n]
+    prompt_ids = _gen_build_prompts(captions, tokenizer, config.vlm)
+    codes = model._sample_image(prompt_ids, num_steps=config.sampling.steps)
+
+    vq = VQTokenizer(config.vlm.vq_repo,
+                     subfolder=config.vlm.get('vq_subfolder', None)).to('cuda').eval()
+    imgs = vq.decode(codes)                              # (B,3,H,W) in [-1,1]
+    out_dir = os.path.join(config.checkpointing.save_dir, 'gen_samples')
+    os.makedirs(out_dir, exist_ok=True)
+    for i, (cap, img) in enumerate(zip(captions, imgs)):
+        arr = ((img.float() + 1) * 127.5).clamp(0, 255).byte()
+        arr = arr.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        Image.fromarray(arr).save(os.path.join(out_dir, f'sample_{i:02d}.png'))
+        print(f'[gen {i}] "{cap[:60]}" -> sample_{i:02d}.png')
+    print(f'Saved {len(captions)} images to {out_dir}')
+
+
 @hydra.main(version_base=None, config_path='configs', config_name='config')
 def main(config):
     L.seed_everything(config.seed)
@@ -174,6 +242,10 @@ def main(config):
         _vlm_sample(config, logger, tokenizer)
     elif config.mode == 'vlm_eval':
         _vlm_eval(config, logger, tokenizer)
+    elif config.mode == 'gen_train':
+        _gen_train(config, logger, tokenizer)
+    elif config.mode == 'gen_sample':
+        _gen_sample(config, logger, tokenizer)
     else:
         _vlm_train(config, logger, tokenizer)
 
