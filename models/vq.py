@@ -40,4 +40,7 @@ class VQTokenizer(nn.Module):
         hw = int(round(n ** 0.5))
         quant = self.model.quantize.get_codebook_entry(
             tokens.reshape(-1), shape=(b, hw, hw, -1))
-        return self.model.decode(quant).sample
+        # We already have the quantized codebook entries — tell diffusers NOT to
+        # re-quantize (its internal cdist re-quantization both wastes work and
+        # errors on the explicit-codes path).
+        return self.model.decode(quant, force_not_quantize=True).sample

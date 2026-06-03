@@ -189,8 +189,16 @@ class UnifiedDiffusion(Diffusion):
             x = self._ddpm_range(x, t, dt, lo, hi)
             x[:, :P] = prompt_ids
             x[:, -1] = self.eoi_id
+        # Final noise removal: fill any remaining MASK with the best valid image
+        # code so no MASK (-> out-of-range code) reaches the VQ decoder.
+        st = self.noise(ts[-1] * torch.ones(B, 1, device=device))[0]
+        st = st.squeeze(-1) if st.ndim > 1 else st
+        lp = self.forward(x, st)
+        lp[:, :, :lo] = self.neg_infinity
+        lp[:, :, hi:] = self.neg_infinity
+        x = torch.where(x == self.mask_index, lp.argmax(-1), x)
         img = x[:, P:P + self.vq_tokens]
-        return img - self.image_base
+        return (img - self.image_base).clamp(0, self.codebook_size - 1)
 
     def _ddpm_range(self, x, t, dt, lo, hi):
         st, _ = self.noise(t)
@@ -235,4 +243,10 @@ class UnifiedDiffusion(Diffusion):
             copy = (x != self.mask_index).to(x.dtype)
             x = copy * x + (1 - copy) * nx
             x[:, :P] = prompt_ids
+        # Final fill: no MASK token left in the generated caption.
+        st = self.noise(ts[-1] * torch.ones(B, 1, device=device))[0]
+        st = st.squeeze(-1) if st.ndim > 1 else st
+        lp = self._forward_understand(x, st[:, None], image_features)
+        x = torch.where(x == self.mask_index, lp.argmax(-1), x)
+        x[:, :P] = prompt_ids
         return x[:, P:]
