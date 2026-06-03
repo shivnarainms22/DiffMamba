@@ -72,3 +72,40 @@ def load_vlm_warmstart(mm_diffusion, ckpt_path: str) -> dict:
     info = load_warmstart(mm_diffusion.backbone, ckpt_path)
     info['mode'] = 'diffmamba'
     return info
+
+
+def load_text_rows_into_expanded(dimamba, ckpt_path: str, base_vocab: int) -> dict:
+    """Warm-start a vocab-EXPANDED DiMamba from a DiffMamba text checkpoint.
+
+    The generation backbone has vocab = base_vocab + markers + image codebook.
+    All non-vocab weights (Mamba layers, sigma_map, norms) load directly; the
+    vocab-sized params (token embedding + lm_head) have more rows than the ckpt,
+    so we copy the first base_vocab rows (text + [MASK]) and leave the marker /
+    image rows freshly initialised.
+
+    Returns {'vocab_rows_copied', 'unexpected'}; caller should assert
+    unexpected == 0 and vocab_rows_copied >= 1.
+    """
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    state = ckpt.get('state_dict', ckpt)
+    # DiffMamba Lightning keys 'backbone.<dimamba-key>' -> strip to dimamba keys.
+    sub = {k[len('backbone.'):]: v for k, v in state.items()
+           if k.startswith('backbone.') and 'ema' not in k}
+
+    target = dict(dimamba.named_parameters())
+    load_dict = {}
+    vocab_copied = 0
+    for k, v in sub.items():
+        if k not in target:
+            continue
+        t = target[k]
+        if t.shape == v.shape:
+            load_dict[k] = v
+        elif (t.dim() == 2 and v.dim() == 2 and t.shape[1] == v.shape[1]
+              and t.shape[0] >= v.shape[0]):
+            # expanded vocab param: copy the text rows in place.
+            with torch.no_grad():
+                t[:v.shape[0]].copy_(v)
+            vocab_copied += 1
+    missing, unexpected = dimamba.load_state_dict(load_dict, strict=False)
+    return {'vocab_rows_copied': vocab_copied, 'unexpected': len(unexpected)}

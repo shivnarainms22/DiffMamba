@@ -1,0 +1,24 @@
+# @package _global_
+#
+# VQ + text->image generation config group (Stage 2). Vocab layout:
+#   text [0..50256] + [MASK]50257 + [BOI]50258 + [EOI]50259 + image [50260..50260+C)
+# GenDiffusion computes boi/eoi/image_base from the base vocab; the ids below are
+# the GPT-2-base values and are used by the dataloader to build sequences.
+vlm:
+  vq_repo: microsoft/vq-diffusion-ithq
+  vq_subfolder: vqvae
+  codebook_size: 4096          # C — image tokens added to the vocab
+  num_image_tokens: 1024       # 32x32 VQ grid
+  caption_len: 32              # fixed caption budget (clean conditioning)
+  boi_id: 50258
+  eoi_id: 50259
+  image_base: 50260
+  # text-backbone warm-start (text rows only; image/marker rows fresh)
+  warmstart_path: /scratch/sarin.s/DiffMamba/runs/runD_lr1e3/checkpoints/best.ckpt
+  # CC3M caption->image source
+  dataset: pixparse/cc3m-wds
+  split: train
+  image_column: jpg
+  caption_column: txt
+  streaming: true
+  max_examples: 80000
