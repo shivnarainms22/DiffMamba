@@ -33,9 +33,11 @@ torch.set_float32_matmul_precision('high')
 import dataloader
 import gen_dataloader
 import mm_dataloader
+import unified_dataloader
 import utils
 from gen_diffusion import GenDiffusion
 from mm_diffusion import MMDiffusion
+from unified_diffusion import UnifiedDiffusion
 
 omegaconf.OmegaConf.register_new_resolver('cwd', os.getcwd)
 omegaconf.OmegaConf.register_new_resolver(
@@ -294,11 +296,37 @@ def _gen_eval(config, logger, tokenizer):
     print(f'Written {out}')
 
 
+def _uni_train(config, logger, tokenizer):
+    logger.info('Starting UNIFIED understand+generate training.')
+    wandb_logger = _build_logger(config)
+    if (config.checkpointing.resume_from_ckpt
+            and config.checkpointing.resume_ckpt_path is not None
+            and utils.fsspec_exists(config.checkpointing.resume_ckpt_path)):
+        ckpt_path = config.checkpointing.resume_ckpt_path
+    else:
+        ckpt_path = None
+
+    train_ds, valid_ds = unified_dataloader.get_unified_dataloaders(config, tokenizer)
+    model = UnifiedDiffusion(config, tokenizer=tokenizer)
+
+    trainer = hydra.utils.instantiate(
+        config.trainer,
+        default_root_dir=os.getcwd(),
+        callbacks=_callbacks(config),
+        strategy=hydra.utils.instantiate(config.strategy),
+        logger=wandb_logger)
+    trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
+
+
 @hydra.main(version_base=None, config_path='configs', config_name='config')
 def main(config):
     L.seed_everything(config.seed)
     logger = utils.get_logger(__name__)
     tokenizer = dataloader.get_tokenizer(config)
+
+    if config.mode == 'uni_train':
+        _uni_train(config, logger, tokenizer)
+        return
 
     if config.mode == 'vlm_sample':
         _vlm_sample(config, logger, tokenizer)

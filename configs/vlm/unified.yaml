@@ -1,0 +1,41 @@
+# @package _global_
+#
+# Unified (understand + generate) config group. Janus-style decoupled: SigLIP
+# prefix for understanding, expanded VQ vocab for generation, one Mamba backbone.
+# Note the TWO image-token counts: SigLIP=196 (understanding), VQ=1024 (generation).
+vlm:
+  # vision (understanding pathway)
+  encoder_name: google/siglip-base-patch16-224
+  vision_dim: 768
+  siglip_tokens: 196
+  projector_hidden: 2048
+
+  # VQ (generation pathway)
+  vq_repo: microsoft/vq-diffusion-ithq
+  vq_subfolder: vqvae
+  codebook_size: 4096
+  vq_tokens: 1024
+  boi_id: 50258
+  eoi_id: 50259
+  image_base: 50260
+
+  # shared text
+  caption_prompt: "Describe the image."
+  caption_len: 64
+
+  # stream weights (per-step summed loss). text off by default — captioning
+  # already exercises text generation; enable for a pure-text safeguard.
+  understand_weight: 1.0
+  generate_weight: 1.0
+  text_weight: 0.0
+
+  # CC3M, used BOTH directions (match max_examples to gen_stage2 to reuse its VQ cache)
+  dataset: pixparse/cc3m-wds
+  split: train
+  image_column: jpg
+  caption_column: txt
+  streaming: true
+  max_examples: 80000
+
+  # warm-start the text rows from the DiffMamba text backbone
+  warmstart_path: /scratch/sarin.s/DiffMamba/runs/runD_lr1e3/checkpoints/best.ckpt
