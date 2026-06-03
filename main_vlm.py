@@ -232,6 +232,69 @@ def _gen_sample(config, logger, tokenizer):
     print(f'Saved {len(captions)} images to {out_dir}')
 
 
+def _gen_generate_pils(model, vq, captions, tokenizer, config, batch_size=8):
+    import numpy as np
+    from PIL import Image
+    pil_imgs = []
+    for s in range(0, len(captions), batch_size):
+        prompt_ids = _gen_build_prompts(captions[s:s + batch_size], tokenizer,
+                                        config.vlm)
+        codes = model._sample_image(prompt_ids, num_steps=config.sampling.steps)
+        for img in vq.decode(codes):
+            arr = ((img.float() + 1) * 127.5).clamp(0, 255).byte()
+            pil_imgs.append(Image.fromarray(
+                arr.permute(1, 2, 0).cpu().numpy().astype(np.uint8)))
+    return pil_imgs
+
+
+def _gen_eval(config, logger, tokenizer):
+    """Held-out CLIP-score: cosine(CLIP image, CLIP caption). Compare matched
+    vs shuffled captions — matched > shuffled means images are text-conditioned."""
+    import json
+    from transformers import CLIPModel, CLIPProcessor
+
+    from models.vq import VQTokenizer
+
+    model = GenDiffusion.load_from_checkpoint(
+        config.eval.checkpoint_path, tokenizer=tokenizer, config=config).to('cuda')
+    if not config.eval.disable_ema and model.ema is not None:
+        model.ema.move_shadow_params_to_device(model.device)
+        model.ema.copy_to(itertools.chain(model.backbone.parameters(),
+                                          model.noise.parameters()))
+    model.eval()
+
+    _, valid_ds = gen_dataloader.get_gen_dataloaders(config, tokenizer)
+    n = min(len(valid_ds.dataset), int(config.eval.get('num_eval', 64)))
+    captions = valid_ds.dataset.captions[:n]
+
+    vq = VQTokenizer(config.vlm.vq_repo,
+                     subfolder=config.vlm.get('vq_subfolder', None)).to('cuda').eval()
+    pil_imgs = _gen_generate_pils(model, vq, captions, tokenizer, config)
+
+    clip = CLIPModel.from_pretrained('openai/clip-vit-base-patch32').to('cuda').eval()
+    proc = CLIPProcessor.from_pretrained('openai/clip-vit-base-patch32')
+    with torch.no_grad():
+        ti = proc(text=captions, return_tensors='pt', padding=True,
+                  truncation=True).to('cuda')
+        tfeat = clip.get_text_features(**ti)
+        tfeat = tfeat / tfeat.norm(dim=-1, keepdim=True)
+        ii = proc(images=pil_imgs, return_tensors='pt').to('cuda')
+        ifeat = clip.get_image_features(**ii)
+        ifeat = ifeat / ifeat.norm(dim=-1, keepdim=True)
+    matched = (ifeat * tfeat).sum(-1).mean().item()
+    mismatched = (ifeat * torch.roll(tfeat, 1, 0)).sum(-1).mean().item()
+
+    summary = {'n': n, 'clip_matched': matched,
+               'clip_mismatched_shuffled': mismatched,
+               'sampling_steps': config.sampling.steps}
+    out = os.path.join(config.checkpointing.save_dir, 'gen_eval.json')
+    json.dump(summary, open(out, 'w'), indent=2)
+    print(f'Gen CLIP-score (n={n}): matched={matched:.3f} vs '
+          f'shuffled={mismatched:.3f}  '
+          f'(matched>shuffled => images are caption-conditioned)')
+    print(f'Written {out}')
+
+
 @hydra.main(version_base=None, config_path='configs', config_name='config')
 def main(config):
     L.seed_everything(config.seed)
@@ -246,6 +309,8 @@ def main(config):
         _gen_train(config, logger, tokenizer)
     elif config.mode == 'gen_sample':
         _gen_sample(config, logger, tokenizer)
+    elif config.mode == 'gen_eval':
+        _gen_eval(config, logger, tokenizer)
     else:
         _vlm_train(config, logger, tokenizer)
 
