@@ -45,3 +45,4 @@ docs/
 *.md
 !README.md
 !DiffMamba_Report.md
+!DiffMamba_VLM_Report.md

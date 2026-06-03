@@ -1,0 +1,29 @@
+# @package _global_
+#
+# Vision config group for the Stage-1 understanding VLM (image -> text).
+# Merged at root via `# @package _global_`; experiment files override `phase`.
+vlm:
+  encoder_name: google/siglip-base-patch16-224
+  vision_dim: 768          # SigLIP base hidden size
+  num_image_tokens: 196    # (224/16)^2 patch tokens (clean prefix length)
+  projector_hidden: 2048   # MLP projector hidden dim
+  phase: align             # align (projector-only) | sft (full fine-tune)
+  # DiffMamba 130M lr=1e-3 backbone (Val PPL 79.3) — the warm-start asset.
+  warmstart_path: /scratch/sarin.s/DiffMamba/runs/runD_lr1e3/checkpoints/best.ckpt
+  text_len: 256            # text positions; image prefix is separate
+  max_examples: null       # cap dataset size for smoke/debug; null = full
+
+  # Generic image-caption loader (see mm_dataloader.get_mm_dataloaders). Default
+  # is a canonical, public, parquet-native classification set used as a caption
+  # source for the smoke (datasets 4.x dropped scripts; most captioning sets are
+  # gated or script-based). label_as_caption=true maps the int label to its
+  # class name as the answer. The real align/sft runs (LLaVA-Pretrain /
+  # LLaVA-Instruct-150K) need the LLaVA-format adapter (Task 13).
+  dataset: uoft-cs/cifar10
+  split: train
+  image_column: img
+  caption_column: label
+  question_column: null    # VQA: per-record prompt column (null => use caption_prompt)
+  label_as_caption: true
+  caption_prompt: "Describe the image."
+  streaming: true

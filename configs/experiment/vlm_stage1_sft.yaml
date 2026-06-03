@@ -1,0 +1,55 @@
+# @package _global_
+#
+# VLM Stage 1 — Phase 2 (instruction/VQA fine-tune). Full FT: SigLIP frozen,
+# unfreeze Mamba backbone + projector, train on VQAv2 (prompt = question).
+# Warm-started from the Phase-1 alignment checkpoint (loads backbone + projector).
+#
+# Usage (GPU node): python main_vlm.py +experiment=vlm_stage1_sft
+
+defaults:
+  - /vlm: siglip_base
+  - override /model: small-dimamba
+  - override /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor, sigterm_save]
+
+backbone: dimamba
+parameterization: subs
+mode: vlm_train
+
+vlm:
+  phase: sft
+  dataset: lmms-lab/VQAv2
+  split: validation          # lmms-lab hosts the eval splits; held-out slice used for eval (Task 14)
+  image_column: image
+  caption_column: multiple_choice_answer
+  question_column: question
+  label_as_caption: false
+  streaming: true
+  max_examples: 40000
+  text_len: 64
+  # Pick up the align phase's trained projector + backbone.
+  warmstart_path: /scratch/sarin.s/DiffMamba/runs/vlm_align/checkpoints/best.ckpt
+
+data:
+  cache_dir: /scratch/sarin.s/data
+
+checkpointing:
+  save_dir: /scratch/sarin.s/DiffMamba/runs/vlm_sft
+
+# 8000 is a multiple of the 2000-step checkpoint interval.
+trainer:
+  max_steps: 8000
+  val_check_interval: 2000
+  gradient_clip_val: 1.0
+  precision: 'bf16-mixed'
+
+loader:
+  global_batch_size: 64
+  batch_size: 16
+
+# Lower LR for full fine-tune than the projector-only align phase.
+optim:
+  lr: 2e-4
+  weight_decay: 0.01
+
+wandb:
+  name: vlm_sft
