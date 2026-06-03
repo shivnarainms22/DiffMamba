@@ -56,27 +56,39 @@ SFT warm-starts from the align checkpoint (backbone **and** trained projector).
 
 **Held-out VQAv2 (200 examples the model never trained on), 64 denoising steps:**
 
-| Metric | Value |
-|---|---|
-| Exact-match (normalized first answer == gold) | **0.250** |
-| Gold-answer recall (gold appears in the generated answer) | **0.330** |
+| Metric | v1 (answer-only loss) | v2 (full-span loss) |
+|---|---|---|
+| Exact-match (normalized answer == gold) | 0.250 | **0.290** |
+| Gold-answer recall (gold appears in the answer) | 0.330 | 0.290 |
 
-**Qualitative (image→text).** The model demonstrably **grounds text in the image** — content
-words track image content across categories:
-- food images → "carrots, broccoli, onions, chicken, beans, pizza"
-- airplanes → "jet engine, warplane flying, anti-aircraft, plane crash"
-- others → "cat", "motorcycle", "ski / ice shelf / ski resort", "umbrella", "pink tiles"
+**v1 → v2: a train/inference fix (see §4.1).** v2 produces clean, terminated answers, so
+exact-match rose and the two metrics converged to 0.29 — in v1 the higher recall (0.33) was
+*inflated* by verbose rambling that incidentally mentioned the gold word; in v2 the prediction
+*is* the answer.
 
-Different images yield different, topically-relevant text — evidence that the
-SigLIP→projector→Mamba-diffusion path conditions on the image. Generated text is **locally
-fluent but globally incoherent and verbose**, with the most on-target content front-loaded
-(the model learned VQA answers are short).
+### 4.1 Termination fix (honest-engineering note)
+
+v1 supervised only the answer + EOS tokens, leaving the trailing padding clean and
+unsupervised. But inference masks and generates the **entire** post-prompt span — including
+the positions that were pad in training — so the model had never learned to emit EOS and stop,
+and it filled every slot, rambling. v2 supervises the **full post-prompt span (answer + EOS +
+pad)**, matching generation. Effect: outputs went from paragraphs to clean short answers, e.g.
+`What is in the image? → "blue"`, `"no"`, `"3"`, `"white"`, and exact-match improved 0.25→0.29.
+
+**Qualitative (image→text).** The model **grounds text in the image** — answers are
+image-influenced (e.g. food images → food words; vehicles → "motorcycle"/"plane"). v2 answers
+are short and well-formed but **lean on common VQA priors** — colors, yes/no, and counts
+("blue", "black", "no", "white", "3") are over-represented. So it answers in the right *form*
+and is image-conditioned, but defaults to high-frequency answers rather than fine visual
+reasoning — the expected behaviour at 130M, proof-run scale.
 
 ## 5. Honest limitations
 
-- **130M quality ceiling.** The backbone already trails its own DiT baseline on *text*
-  (79.3 vs 70.5 ppl); VLM quality inherits that ceiling. Outputs are relevant-but-incoherent
-  by design at this scale, not a bug.
+- **130M quality ceiling + answer-prior reliance.** The backbone already trails its own DiT
+  baseline on *text* (79.3 vs 70.5 ppl); VLM quality inherits that ceiling. After the
+  termination fix (§4.1) answers are clean and well-formed but lean on high-frequency VQA
+  answers (colors / yes-no / counts) rather than fine visual reasoning — expected at this
+  scale, not a bug.
 - **Proof-run scale.** ~80K caption + ~40K VQA examples, 6K+8K steps — a fraction of the
   LLaVA recipe (558K + 150K). Numbers would improve with scale but the qualitative story
   (works, modest) would not change materially at 130M.
