@@ -275,13 +275,11 @@ def _gen_eval(config, logger, tokenizer):
     clip = CLIPModel.from_pretrained('openai/clip-vit-base-patch32').to('cuda').eval()
     proc = CLIPProcessor.from_pretrained('openai/clip-vit-base-patch32')
     with torch.no_grad():
-        ti = proc(text=captions, return_tensors='pt', padding=True,
-                  truncation=True).to('cuda')
-        tfeat = clip.get_text_features(**ti)
-        tfeat = tfeat / tfeat.norm(dim=-1, keepdim=True)
-        ii = proc(images=pil_imgs, return_tensors='pt').to('cuda')
-        ifeat = clip.get_image_features(**ii)
-        ifeat = ifeat / ifeat.norm(dim=-1, keepdim=True)
+        inputs = proc(text=captions, images=pil_imgs, return_tensors='pt',
+                      padding=True, truncation=True).to('cuda')
+        out = clip(**inputs)
+        ifeat = out.image_embeds / out.image_embeds.norm(dim=-1, keepdim=True)
+        tfeat = out.text_embeds / out.text_embeds.norm(dim=-1, keepdim=True)
     matched = (ifeat * tfeat).sum(-1).mean().item()
     mismatched = (ifeat * torch.roll(tfeat, 1, 0)).sum(-1).mean().item()
 
