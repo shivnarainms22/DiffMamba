@@ -8,6 +8,7 @@ separate so the text-only DiffMamba entry (main.py) stays untouched.
   python main_vlm.py +experiment=vlm_stage1_align mode=vlm_sample \
     eval.checkpoint_path=.../checkpoints/best.ckpt         # (Task 12)
 """
+import itertools
 import os
 
 import fsspec
