@@ -408,6 +408,74 @@ def _uni_eval(config, logger, tokenizer):
     print(f'  written {out_path}')
 
 
+def _vlm_caption_eval(config, logger, tokenizer):
+    """Baseline for the unified-eval UNDERSTANDING metric.
+
+    Captions held-out images with the STANDALONE Stage-1 model and scores
+    text-CLIP(generated caption, gold caption) matched vs shuffled — the exact
+    same metric and CLIP path as `_uni_eval`'s understanding side. This is the
+    reference the unified number needs to be interpreted: if a dedicated
+    captioner also sits at matched~=shuffled, the metric is at its floor for a
+    130M model on noisy CC3M alt-text (not a unification collapse).
+
+    Run under the Stage-1 captioner config so the data is CC3M captioning and
+    the config matches the checkpoint, e.g.:
+      python main_vlm.py +experiment=vlm_stage1_align mode=vlm_caption_eval \\
+        eval.checkpoint_path=.../runs/vlm_align/checkpoints/best.ckpt
+    (Generation has no analogous gap: `mode=gen_eval` already reports the
+    standalone image-CLIP matched-vs-shuffled baseline.)
+    """
+    import json
+    from transformers import CLIPModel, CLIPProcessor
+
+    model = _load_eval_model(config, tokenizer)
+    _, valid_ds = mm_dataloader.get_mm_dataloaders(config, tokenizer)
+    ds = valid_ds.dataset
+    n = min(len(ds), int(config.eval.get('num_eval', 48)))
+    steps = config.sampling.steps
+
+    clip = CLIPModel.from_pretrained('openai/clip-vit-base-patch32').to('cuda').eval()
+    proc = CLIPProcessor.from_pretrained('openai/clip-vit-base-patch32')
+
+    p = [tokenizer.bos_token_id] + tokenizer.encode(
+        config.vlm.caption_prompt, add_special_tokens=False)
+    gen_caps, gold_caps = [], []
+    with torch.no_grad():
+        for s in range(0, n, 8):
+            idxs = list(range(s, min(s + 8, n)))
+            feats = torch.stack([ds[i]['image_features'] for i in idxs]).to('cuda')
+            prompt_ids = torch.tensor(p, device='cuda')[None].repeat(len(idxs), 1)
+            out = model._sample_conditional(feats, prompt_ids, num_steps=steps)
+            for j, i in enumerate(idxs):
+                ids = out[j, len(p):].tolist()
+                if tokenizer.eos_token_id in ids:
+                    ids = ids[:ids.index(tokenizer.eos_token_id)]
+                gen_caps.append(tokenizer.decode(ids).strip() or ' ')
+                gold_caps.append(ds.text_records[i]['answer'])
+        ge = _clip_text_embeds(clip, proc, gen_caps)
+        go = _clip_text_embeds(clip, proc, gold_caps)
+    matched = (ge * go).sum(-1).mean().item()
+    shuffled = (ge * torch.roll(go, 1, 0)).sum(-1).mean().item()
+
+    print('--- DEBUG: first 5 (generated | gold) captions ---')
+    for gc, gd in list(zip(gen_caps, gold_caps))[:5]:
+        print(f'  GEN : {gc[:70]!r}')
+        print(f'  GOLD: {gd[:70]!r}')
+    print(f'  unique generated captions: {len(set(gen_caps))} / {len(gen_caps)}')
+
+    summary = {'n': n, 'understand_matched': matched,
+               'understand_shuffled': shuffled, 'sampling_steps': steps,
+               'checkpoint': config.eval.checkpoint_path}
+    out_path = os.path.join(config.checkpointing.save_dir, 'vlm_caption_eval.json')
+    json.dump(summary, open(out_path, 'w'), indent=2)
+    print(f'STANDALONE caption baseline (n={n}): '
+          f'understand matched={matched:.3f} vs shuffled={shuffled:.3f}')
+    print('  compare to uni_eval understand matched/shuffled: a clear matched>'
+          'shuffled here but not in uni_eval => real forgetting; ~equal in both '
+          '=> metric floor, not collapse')
+    print(f'  written {out_path}')
+
+
 @hydra.main(version_base=None, config_path='configs', config_name='config')
 def main(config):
     L.seed_everything(config.seed)
@@ -419,6 +487,9 @@ def main(config):
         return
     if config.mode == 'uni_eval':
         _uni_eval(config, logger, tokenizer)
+        return
+    if config.mode == 'vlm_caption_eval':
+        _vlm_caption_eval(config, logger, tokenizer)
         return
 
     if config.mode == 'vlm_sample':
