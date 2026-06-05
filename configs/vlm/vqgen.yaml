@@ -13,6 +13,9 @@ vlm:
   boi_id: 50258
   eoi_id: 50259
   image_base: 50260
+  # Probability of replacing caption tokens with PAD during generation training.
+  # Use >0 for classifier-free guidance checkpoints; default keeps old behavior.
+  caption_dropout_prob: 0.0
   # text-backbone warm-start (text rows only; image/marker rows fresh)
   warmstart_path: /scratch/sarin.s/DiffMamba/runs/runD_lr1e3/checkpoints/best.ckpt
   # CC3M caption->image source

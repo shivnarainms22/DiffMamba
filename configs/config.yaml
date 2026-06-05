@@ -31,6 +31,9 @@ sampling:
   predictor: ddpm_cache  # analytic, ddpm, ddpm_cache
   steps: 128
   noise_removal: True
+  # 1.0 = standard conditional sampling. >1.0 enables classifier-free guidance
+  # for text->image VQ-token samplers that support it.
+  cfg_scale: 1.0
   # TODO(yair): @subham, why aren't these params under `eval`?
   num_sample_batches: 2  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
   num_sample_log: 2

@@ -1,0 +1,14 @@
+name: small-hybrid-dimamba
+type: hybrid_dimamba
+hidden_size: 768
+cond_dim: 128
+length: 1024
+n_blocks: 12
+n_heads: 12
+scale_by_sigma: True
+dropout: 0.1
+temb_strategy: adaln
+tie_word_embeddings: False
+# Insert attention at layers 3, 7, 11 for the 12-block 130M-class model.
+hybrid_attention_every: 4
+hybrid_attention_offset: 3

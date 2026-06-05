@@ -7,6 +7,7 @@ gen_dataloader.py — data pipeline for the masked-diffusion text→image genera
 import hashlib
 import json
 import os
+import random
 from typing import Dict, List
 
 import numpy as np
@@ -24,6 +25,7 @@ def build_gen_sequence(
     pad: int,
     caption_len: int,
     num_image_tokens: int,
+    drop_caption: bool = False,
 ) -> Dict[str, List[int]]:
     """Build a single generation sequence: [BOS] caption(padded) [BOI] image_tokens [EOI].
 
@@ -50,9 +52,14 @@ def build_gen_sequence(
         f"Expected {num_image_tokens} image tokens, got {len(image_tokens)}"
     )
 
-    # Truncate then right-pad caption to exactly caption_len.
-    cap = list(caption_ids[:caption_len])
-    cap += [pad] * (caption_len - len(cap))
+    # Truncate then right-pad caption to exactly caption_len. For CFG training,
+    # the unconditional branch drops caption content while preserving the fixed
+    # [BOS] ... [BOI] prompt shape.
+    if drop_caption:
+        cap = [pad] * caption_len
+    else:
+        cap = list(caption_ids[:caption_len])
+        cap += [pad] * (caption_len - len(cap))
 
     ids = [bos] + cap + [boi] + list(image_tokens) + [eoi]
 
@@ -170,12 +177,15 @@ class GenDataset(torch.utils.data.Dataset):
         codes = np.asarray(self._codes()[self.index_offset + i]).astype('int64')
         image_tokens = [code_to_id(int(c), self.v.image_base) for c in codes]
         cap_ids = self.tokenizer.encode(self.captions[i], add_special_tokens=False)
+        drop_prob = float(self.v.get('caption_dropout_prob', 0.0))
+        drop_caption = drop_prob > 0 and random.random() < drop_prob
         tl = build_gen_sequence(
             cap_ids, image_tokens,
             bos=self.tokenizer.bos_token_id, boi=self.v.boi_id,
             eoi=self.v.eoi_id, pad=self.tokenizer.pad_token_id,
             caption_len=self.v.caption_len,
-            num_image_tokens=self.v.num_image_tokens)
+            num_image_tokens=self.v.num_image_tokens,
+            drop_caption=drop_caption)
         return {
             'input_ids': torch.tensor(tl['input_ids'], dtype=torch.long),
             'attention_mask': torch.tensor(tl['attention_mask'], dtype=torch.float),

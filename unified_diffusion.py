@@ -13,6 +13,7 @@ import itertools
 
 import torch
 
+from cfg_utils import cfg_combine_log_probs, make_unconditional_prompt
 import models
 import utils
 from diffusion import Diffusion, Loss, _sample_categorical
@@ -193,28 +194,39 @@ class UnifiedDiffusion(Diffusion):
         lo, hi = self.image_base, self.image_base + self.codebook_size
         for i in range(num_steps):
             t = ts[i] * torch.ones(B, 1, device=device)
-            x = self._ddpm_range(x, t, dt, lo, hi)
+            x = self._ddpm_range(x, t, dt, lo, hi, prompt_len=P)
             x[:, :P] = prompt_ids
             x[:, -1] = self.eoi_id
         # Final noise removal: fill any remaining MASK with the best valid image
         # code so no MASK (-> out-of-range code) reaches the VQ decoder.
         st = self.noise(ts[-1] * torch.ones(B, 1, device=device))[0]
         st = st.squeeze(-1) if st.ndim > 1 else st
-        lp = self.forward(x, st)
+        lp = self._guided_image_forward(x, st, prompt_len=P)
         lp[:, :, :lo] = self.neg_infinity
         lp[:, :, hi:] = self.neg_infinity
         x = torch.where(x == self.mask_index, lp.argmax(-1), x)
         img = x[:, P:P + self.vq_tokens]
         return (img - self.image_base).clamp(0, self.codebook_size - 1)
 
-    def _ddpm_range(self, x, t, dt, lo, hi):
+    def _guided_image_forward(self, x, sigma, prompt_len):
+        scale = float(self.config.sampling.get('cfg_scale', 1.0))
+        if scale == 1.0:
+            return self.forward(x, sigma)
+        x_uncond = make_unconditional_prompt(
+            x, prompt_len=prompt_len,
+            pad_token_id=self.tokenizer.pad_token_id)
+        cond = self.forward(x, sigma)
+        uncond = self.forward(x_uncond, sigma)
+        return cfg_combine_log_probs(cond, uncond, scale)
+
+    def _ddpm_range(self, x, t, dt, lo, hi, prompt_len):
         st, _ = self.noise(t)
         ss, _ = self.noise(t - dt)
         st = st.squeeze(-1) if st.ndim > 1 else st
         ss = ss.squeeze(-1) if ss.ndim > 1 else ss
         mt = (1 - torch.exp(-st))[:, None, None]
         ms = (1 - torch.exp(-ss))[:, None, None]
-        lp = self.forward(x, st)
+        lp = self._guided_image_forward(x, st, prompt_len)
         lp[:, :, :lo] = self.neg_infinity
         lp[:, :, hi:] = self.neg_infinity
         lp = lp - torch.logsumexp(lp, dim=-1, keepdim=True)

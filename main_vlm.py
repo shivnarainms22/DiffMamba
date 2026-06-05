@@ -10,12 +10,14 @@ separate so the text-only DiffMamba entry (main.py) stays untouched.
 """
 import itertools
 import os
+import copy
 
 import fsspec
 import hydra
 import lightning as L
 import omegaconf
 import torch
+from omegaconf import open_dict
 
 # Same self-produced-checkpoint torch.load shim as main.py (Lightning passes
 # weights_only=True explicitly on resume; our ckpts store OmegaConf objects).
@@ -38,6 +40,7 @@ import utils
 from gen_diffusion import GenDiffusion
 from mm_diffusion import MMDiffusion
 from unified_diffusion import UnifiedDiffusion
+from vlm_eval_utils import score_vqa_answer, summarize_vqa_rows
 
 omegaconf.OmegaConf.register_new_resolver('cwd', os.getcwd)
 omegaconf.OmegaConf.register_new_resolver(
@@ -408,6 +411,112 @@ def _uni_eval(config, logger, tokenizer):
     print(f'  written {out_path}')
 
 
+def _load_unified_eval_model(config, tokenizer):
+    model = UnifiedDiffusion.load_from_checkpoint(
+        config.eval.checkpoint_path, tokenizer=tokenizer, config=config).to('cuda')
+    if config.eval.disable_ema:
+        model.ema = None
+    elif model.ema is not None:
+        model.ema.move_shadow_params_to_device(model.device)
+        model.ema.copy_to(itertools.chain(model.backbone.parameters(),
+                                          model.projector.parameters(),
+                                          model.noise.parameters()))
+    model.eval()
+    return model
+
+
+def _unified_vqa_view(config):
+    cfg = copy.deepcopy(config)
+    v = config.vlm
+    with open_dict(cfg):
+        cfg.vlm.num_image_tokens = v.siglip_tokens
+        cfg.vlm.text_len = v.get('vqa_text_len', v.caption_len)
+        cfg.vlm.dataset = v.get('vqa_dataset', 'lmms-lab/VQAv2')
+        cfg.vlm.split = v.get('vqa_split', 'validation')
+        cfg.vlm.image_column = v.get('vqa_image_column', 'image')
+        cfg.vlm.caption_column = v.get(
+            'vqa_caption_column', 'multiple_choice_answer')
+        cfg.vlm.question_column = v.get('vqa_question_column', 'question')
+        cfg.vlm.label_as_caption = False
+        cfg.vlm.streaming = True
+        cfg.vlm.max_examples = v.get('vqa_max_examples', 40000)
+    return cfg
+
+
+def _decode_answer(tokenizer, ids):
+    ids = list(ids)
+    if tokenizer.eos_token_id in ids:
+        ids = ids[:ids.index(tokenizer.eos_token_id)]
+    if tokenizer.pad_token_id is not None:
+        ids = [i for i in ids if i != tokenizer.pad_token_id]
+    return tokenizer.decode(ids).strip()
+
+
+def _uni_vqa_eval(config, logger, tokenizer):
+    """Unified-model VQA eval with shuffled-image ablation.
+
+    This measures the understanding behavior Stage 3 previously could not
+    resolve with free-form caption CLIP: exact/recalled short answers against
+    VQAv2-style gold labels, plus the same prompts paired with shuffled image
+    features to estimate how much accuracy is genuinely image-conditioned.
+    """
+    import json
+
+    model = _load_unified_eval_model(config, tokenizer)
+    _, valid_ds = mm_dataloader.get_mm_dataloaders(
+        _unified_vqa_view(config), tokenizer)
+    ds = valid_ds.dataset
+    n_eval = min(len(ds), int(config.eval.get('num_eval', 200)))
+    steps = config.sampling.steps
+
+    rows = []
+    with torch.no_grad():
+        for i in range(n_eval):
+            rec = ds.text_records[i]
+            q, gold = rec['prompt'], rec['answer']
+            prompt = [tokenizer.bos_token_id] + tokenizer.encode(
+                q, add_special_tokens=False)
+            prompt_ids = torch.tensor(prompt, device='cuda')[None]
+
+            feats = ds[i]['image_features'][None].to('cuda')
+            shuffled_feats = ds[(i + 1) % n_eval]['image_features'][None].to('cuda')
+
+            out = model._sample_caption(
+                feats, prompt_ids, num_steps=steps)
+            shuffled = model._sample_caption(
+                shuffled_feats, prompt_ids, num_steps=steps)
+
+            gen = _decode_answer(tokenizer, out[0].tolist())
+            gen_shuf = _decode_answer(tokenizer, shuffled[0].tolist())
+            exact, recall = score_vqa_answer(gen, gold)
+            shuf_exact, shuf_recall = score_vqa_answer(gen_shuf, gold)
+
+            rows.append({
+                'question': q,
+                'gold': gold,
+                'generated_correct': gen,
+                'generated_shuffled': gen_shuf,
+                'correct_exact': exact,
+                'correct_recall': recall,
+                'shuffled_exact': shuf_exact,
+                'shuffled_recall': shuf_recall,
+            })
+
+    summary = summarize_vqa_rows(rows, sampling_steps=steps)
+    summary['checkpoint'] = config.eval.checkpoint_path
+    out_path = os.path.join(config.checkpointing.save_dir, 'uni_vqa_eval.json')
+    json.dump({'summary': summary, 'rows': rows}, open(out_path, 'w'), indent=2)
+
+    print(f'UNIFIED VQA eval ({n_eval} held-out VQAv2-style examples):')
+    print(f'  correct image:  exact={summary["correct_exact_match"]:.3f}  '
+          f'recall={summary["correct_gold_recall"]:.3f}')
+    print(f'  shuffled image: exact={summary["shuffled_exact_match"]:.3f}  '
+          f'recall={summary["shuffled_gold_recall"]:.3f}')
+    print(f'  image delta:    exact={summary["image_ablation_exact_delta"]:.3f}  '
+          f'recall={summary["image_ablation_recall_delta"]:.3f}')
+    print(f'  written {out_path}')
+
+
 def _vlm_caption_eval(config, logger, tokenizer):
     """Baseline for the unified-eval UNDERSTANDING metric.
 
@@ -487,6 +596,9 @@ def main(config):
         return
     if config.mode == 'uni_eval':
         _uni_eval(config, logger, tokenizer)
+        return
+    if config.mode == 'uni_vqa_eval':
+        _uni_vqa_eval(config, logger, tokenizer)
         return
     if config.mode == 'vlm_caption_eval':
         _vlm_caption_eval(config, logger, tokenizer)

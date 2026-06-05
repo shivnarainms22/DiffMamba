@@ -15,6 +15,7 @@ import itertools
 
 import torch
 
+from cfg_utils import cfg_combine_log_probs, make_unconditional_prompt
 import models
 import utils
 from diffusion import Diffusion, Loss, _sample_categorical
@@ -139,13 +140,14 @@ class GenDiffusion(Diffusion):
         img_lo, img_hi = self.image_base, self.image_base + self.codebook_size
         for i in range(num_steps):
             t = timesteps[i] * torch.ones(B, 1, device=device)
-            x = self._ddpm_image_update(x, t, dt, img_lo, img_hi)
+            x = self._ddpm_image_update(x, t, dt, img_lo, img_hi,
+                                        prompt_len=P)
             x[:, :P] = prompt_ids                       # keep prompt fixed
             x[:, -1] = self.eoi_id
         if self.config.sampling.noise_removal:
             t = timesteps[-1] * torch.ones(B, 1, device=device)
             sigma = self.noise(t)[0]
-            logits = self.forward(x, sigma)
+            logits = self._guided_image_forward(x, sigma, prompt_len=P)
             logits[:, :, :img_lo] = self.neg_infinity
             logits[:, :, img_hi:] = self.neg_infinity
             x = logits.argmax(-1)
@@ -153,7 +155,18 @@ class GenDiffusion(Diffusion):
         img = x[:, P:P + n_img]
         return img - self.image_base                    # -> code indices
 
-    def _ddpm_image_update(self, x, t, dt, img_lo, img_hi):
+    def _guided_image_forward(self, x, sigma, prompt_len):
+        scale = float(self.config.sampling.get('cfg_scale', 1.0))
+        if scale == 1.0:
+            return self.forward(x, sigma)
+        x_uncond = make_unconditional_prompt(
+            x, prompt_len=prompt_len,
+            pad_token_id=self.tokenizer.pad_token_id)
+        cond = self.forward(x, sigma)
+        uncond = self.forward(x_uncond, sigma)
+        return cfg_combine_log_probs(cond, uncond, scale)
+
+    def _ddpm_image_update(self, x, t, dt, img_lo, img_hi, prompt_len):
         sigma_t, _ = self.noise(t)
         sigma_s, _ = self.noise(t - dt)
         if sigma_t.ndim > 1:
@@ -163,7 +176,7 @@ class GenDiffusion(Diffusion):
         move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
         move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
 
-        log_p_x0 = self.forward(x, sigma_t)
+        log_p_x0 = self._guided_image_forward(x, sigma_t, prompt_len)
         # Restrict generation to valid image-code tokens (mask/text/markers off).
         log_p_x0[:, :, :img_lo] = self.neg_infinity
         log_p_x0[:, :, img_hi:] = self.neg_infinity

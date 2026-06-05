@@ -7,6 +7,10 @@ try:
 except ModuleNotFoundError:
     pass
 try:
+    from . import hybrid_dimamba
+except ModuleNotFoundError:
+    pass
+try:
     from . import ema
 except ModuleNotFoundError:
     pass
