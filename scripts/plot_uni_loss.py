@@ -31,9 +31,13 @@ def main():
 
     for f in files:
         df = pd.read_csv(f)
+        # prefer the named train losses; otherwise grab anything with 'loss'
         cols = [c for c in WANT if c in df.columns]
         if not cols:
-            print(f'\n=== {f} === (no train loss columns)')
+            cols = [c for c in df.columns if 'loss' in c.lower()]
+        if not cols:
+            print(f'\n=== {f} === (no loss columns)')
+            print('    columns present:', list(df.columns))
             continue
         out = (df[['step'] + cols]
                .dropna(subset=cols, how='all')
