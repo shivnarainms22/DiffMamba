@@ -1,0 +1,42 @@
+# @package _global_
+#
+# Unification — one model that understands (SigLIP prefix) AND generates (VQ
+# tokens), trained jointly on CC3M bidirectionally (+ optional pure text).
+#
+# Usage (GPU node): python main_vlm.py +experiment=uni_stage3
+
+defaults:
+  - /vlm: unified
+  - override /model: small-dimamba
+  - override /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor, sigterm_save]
+
+backbone: dimamba
+parameterization: subs
+mode: uni_train
+
+data:
+  cache_dir: /scratch/sarin.s/data
+
+checkpointing:
+  save_dir: /scratch/sarin.s/DiffMamba/runs/uni_stage3
+
+# 12000 (mult of the 2000-step ckpt interval) — recovery: warm-started projector
+# + more joint steps to overcome the cold-start collapse.
+trainer:
+  max_steps: 12000
+  val_check_interval: 2000
+  gradient_clip_val: 1.0
+  precision: 'bf16-mixed'
+
+# Each step runs an understanding (~260-tok) AND a generation (~1091-tok) batch;
+# keep the micro-batch small and let accumulation rebuild the global batch.
+loader:
+  global_batch_size: 32
+  batch_size: 4
+
+optim:
+  lr: 3e-4
+  weight_decay: 0.01
+
+wandb:
+  name: uni_stage3
