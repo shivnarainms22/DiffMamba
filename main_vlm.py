@@ -517,6 +517,50 @@ def _uni_vqa_eval(config, logger, tokenizer):
     print(f'  written {out_path}')
 
 
+def _uni_vqa_diag(config, logger, tokenizer):
+    """Diagnostic for the all-empty uni_vqa_eval generations.
+
+    For the first few VQAv2-style examples, generate an answer region with BOTH
+    the actual question prompt AND the in-distribution caption prompt
+    ("Describe the image."), printing the raw token ids and the decoded string.
+
+    Reads the result like this:
+      - caption decoded is non-empty (real words) but the question answer is
+        empty/EOS-first  -> the image+feature pipeline is fine; the unified
+        captioner simply has no question-answering ability (OOD prompt).
+      - caption answer is ALSO empty -> the VQAv2 feature pipeline is broken,
+        not the prompt; chase the features.
+    """
+    model = _load_unified_eval_model(config, tokenizer)
+    _, valid_ds = mm_dataloader.get_mm_dataloaders(
+        _unified_vqa_view(config), tokenizer)
+    ds = valid_ds.dataset
+    steps = config.sampling.steps
+    cap_prompt = config.vlm.caption_prompt
+    n = min(len(ds), int(config.eval.get('num_diag', 8)))
+
+    def _gen(feats, text):
+        p = [tokenizer.bos_token_id] + tokenizer.encode(
+            text, add_special_tokens=False)
+        pids = torch.tensor(p, device='cuda')[None]
+        return model._sample_caption(feats, pids, num_steps=steps)[0].tolist()
+
+    print(f'EOS id={tokenizer.eos_token_id}  PAD id={tokenizer.pad_token_id}  '
+          f'caption_prompt={cap_prompt!r}  steps={steps}')
+    with torch.no_grad():
+        for i in range(n):
+            rec = ds.text_records[i]
+            q, gold = rec['prompt'], rec['answer']
+            feats = ds[i]['image_features'][None].to('cuda')
+            qout = _gen(feats, q)
+            cout = _gen(feats, cap_prompt)
+            print(f'[{i}] Q={q!r} gold={gold!r}')
+            print(f'    question -> ids[:12]={qout[:12]}  '
+                  f'decoded={_decode_answer(tokenizer, qout)!r}')
+            print(f'    caption  -> ids[:12]={cout[:12]}  '
+                  f'decoded={_decode_answer(tokenizer, cout)!r}')
+
+
 def _vlm_caption_eval(config, logger, tokenizer):
     """Baseline for the unified-eval UNDERSTANDING metric.
 
@@ -599,6 +643,9 @@ def main(config):
         return
     if config.mode == 'uni_vqa_eval':
         _uni_vqa_eval(config, logger, tokenizer)
+        return
+    if config.mode == 'uni_vqa_diag':
+        _uni_vqa_diag(config, logger, tokenizer)
         return
     if config.mode == 'vlm_caption_eval':
         _vlm_caption_eval(config, logger, tokenizer)
