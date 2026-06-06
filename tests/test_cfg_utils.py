@@ -24,11 +24,12 @@ def test_cfg_combine_log_probs_scale_one_is_conditional():
     cond = torch.tensor([[[0.1, 0.9]]])
     uncond = torch.tensor([[[0.5, 0.5]]])
     out = cfg_combine_log_probs(cond, uncond, scale=1.0)
-    assert torch.equal(out, cond)
+    # scale=1.0 is the conditional up to float rounding (a+1*(b-a) != b bitwise).
+    assert torch.allclose(out, cond)
 
 
 def test_cfg_combine_log_probs_extrapolates_from_unconditional():
     cond = torch.tensor([[[2.0, 4.0]]])
     uncond = torch.tensor([[[1.0, 1.5]]])
     out = cfg_combine_log_probs(cond, uncond, scale=2.0)
-    assert torch.equal(out, torch.tensor([[[3.0, 6.5]]]))
+    assert torch.allclose(out, torch.tensor([[[3.0, 6.5]]]))
