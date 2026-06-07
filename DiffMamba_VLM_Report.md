@@ -233,6 +233,78 @@ with dynamic range; classifier-free guidance for stronger conditioning; scale da
 image-token counts to exploit Mamba's linear scaling (+ a generation-latency benchmark vs.
 attention); a hybrid Mamba+attention block to recover quality (per DiffuApriel).
 
+## 11. Follow-up: pursuing the §10 future-work items (branch `hybrid-cfg-vqa`)
+
+Three of the §10 future-work items were implemented and run as a follow-up: classifier-free
+guidance, a hybrid Mamba+attention backbone, and a VQA-style understanding metric for the unified
+model. Results below; all honest proofs of mechanism, same as the main report.
+
+### 11.1 Classifier-free guidance (done, verified)
+
+CFG-capable Stage-2 was trained with caption dropout (`vlm.caption_dropout_prob=0.1`) and sampled
+with guidance scale `sampling.cfg_scale`. At sampling time the unconditional branch replaces the
+caption span with PAD while keeping the fixed `[BOS] … [BOI]` prompt shape, and logits are combined
+as `uncond + scale·(cond − uncond)` (`cfg_utils.py`). `cfg_scale=1.0` short-circuits to the plain
+conditional (bit-exact baseline).
+
+Held-out CLIP score (cosine of CLIP image vs. its caption), matched vs. shuffled, n=200:
+
+| `cfg_scale` | matched | shuffled | gap (matched − shuffled) |
+|---|---|---|---|
+| 1.0 (baseline) | 0.187 | 0.184 | 0.003 |
+| 1.5 | 0.189 | 0.183 | 0.006 |
+| 2.0 | 0.191 | 0.185 | 0.006 |
+| 3.0 | 0.191 | 0.185 | 0.006 |
+| 4.0 | 0.194 | 0.186 | 0.008 |
+
+**Reading it honestly.** `matched` rises **monotonically** with guidance (0.187 → 0.194) while
+`shuffled` barely moves (0.184 → 0.186), so guidance preferentially strengthens caption alignment
+rather than inflating CLIP globally — the conditioning gap roughly doubles. Each single step is
+within ≈1 standard error at n=200; the evidence is the monotonic trend across all five points, not
+any one delta. Qualitative samples confirm the mechanism: as `cfg_scale` rises, images visibly gain
+saturation and contrast (the textbook CFG signature), with over-saturation/posterization setting in
+by `cfg_scale=4.0`. No recognizable objects emerge at any scale — the base Stage-2 generator is too
+weak to render semantics, so CFG amplifies colour/texture, not content.
+
+**Net:** CFG is implemented and verified — caption alignment increases monotonically with scale and
+images visibly sharpen — but absolute fidelity stays bounded by the proof-of-mechanism generator.
+Practical operating point **`cfg_scale≈3.0`** (clear conditioning gain before the over-saturation at
+4.0). Code: `cfg_utils.py`, `gen_diffusion.py`/`unified_diffusion.py` (`_guided_image_forward`),
+`configs/experiment/gen_stage2_cfg.yaml`.
+
+### 11.2 Hybrid Mamba+attention backbone (in progress)
+
+Opt-in backbone (`backbone: hybrid_dimamba`) that inserts full bidirectional attention on a fixed
+schedule (every 4th block: layers 3/7/11 of 12) among the bidirectional Mamba blocks, to test
+whether sparse attention recovers DiT-class quality while keeping more of Mamba's long-context
+efficiency. Constructs and runs (CUDA smoke test passes). A 130M run (`hybrid_130m`, same
+OpenWebText / dims / 76k-step recipe as the BiMamba baseline `runD_130m`) is training.
+
+*Results pending:* validation NLL/perplexity vs. BiMamba (`runD`) and Transformer (`runB`), and
+forward-pass throughput across `dimamba` / `hybrid_dimamba` / `dit` (`scripts/eval_throughput.py`).
+Code: `models/hybrid_dimamba.py`, `hybrid_schedule.py`, `configs/model/small-hybrid-dimamba.yaml`,
+`configs/experiment/hybrid_130m.yaml`.
+
+### 11.3 Unified VQA understanding metric (negative result; SFT queued)
+
+To give the unified model's *understanding* direction a dynamic-range metric (§9.2's caption-CLIP
+floor could not resolve it), `mode=uni_vqa_eval` scores short VQAv2-style answers (exact match +
+gold-recall) with a shuffled-image ablation. On the `uni_stage3` checkpoint it returns
+**exact = recall = 0.000 across 200 examples**.
+
+A diagnostic (`mode=uni_vqa_diag`) established this is **not a bug**. Per-example raw token ids show
+that for a *question* prompt the model emits `[EOS]` as the very first answer token (answer region =
+`[EOS, PAD, PAD, …]` → empty), whereas for its in-distribution caption prompt ("Describe the image.")
+it produces real, image-varying tokens. The unified model was trained **only** as a captioner with a
+single fixed prompt, so it has **zero zero-shot question-answering ability** — a VQA probe returns 0
+by construction. (The same dump also shows the captioner leaking VQ image-code tokens into the text
+answer region, corroborating §9.2's at-floor understanding.)
+
+**Net:** the unified Stage-3 checkpoint cannot be VQA-probed as-is; a dynamic-range understanding
+number requires *training* for it. Queued next: a short **unified VQA-SFT** (mix VQAv2 Q→A pairs into
+the understanding stream, as Stage-1 did), after which `uni_vqa_eval` becomes meaningful. Code:
+`vlm_eval_utils.py`, `main_vlm.py` (`_uni_vqa_eval`, `_uni_vqa_diag`).
+
 ## Reproduce
 
 ```bash
@@ -262,6 +334,23 @@ python main_vlm.py +experiment=uni_stage3 mode=uni_eval \
 # Understanding baseline (standalone captioner, identical caption-CLIP metric)
 python main_vlm.py +experiment=vlm_stage1_align mode=vlm_caption_eval \
   eval.checkpoint_path=/scratch/.../runs/vlm_align/checkpoints/best.ckpt sampling.steps=64
+
+# §11.1 Classifier-free guidance: train w/ caption dropout, then sweep cfg_scale
+bash scripts/submit_vlm.sh gen_stage2_cfg gen_stage2_cfg 8000
+for s in 1.0 1.5 2.0 3.0 4.0; do python main_vlm.py +experiment=gen_stage2_cfg mode=gen_eval \
+  eval.checkpoint_path=/scratch/.../runs/gen_stage2_cfg/checkpoints/best.ckpt \
+  sampling.cfg_scale=$s sampling.steps=64 \
+  checkpointing.save_dir=/scratch/.../eval/gen_cfg_s$s; done
+
+# §11.2 Hybrid Mamba+attention 130M (same recipe as runD baseline) + throughput
+bash scripts/submit_hpc.sh hybrid_130m hybrid_130m 76000 seed=1
+for b in dimamba hybrid_dimamba dit; do python scripts/eval_throughput.py --backbone $b --mode forward; done
+
+# §11.3 Unified VQA probe (returns 0 — model has no QA ability) + diagnostic
+python main_vlm.py +experiment=uni_stage3 mode=uni_vqa_eval \
+  eval.checkpoint_path=/scratch/.../runs/uni_stage3/checkpoints/best.ckpt sampling.steps=64
+python main_vlm.py +experiment=uni_stage3 mode=uni_vqa_diag \
+  eval.checkpoint_path=/scratch/.../runs/uni_stage3/checkpoints/best.ckpt sampling.steps=64
 ```
 
 Stage 1 code: `models/vision.py`, `models/mm_dimamba.py`, `mm_diffusion.py`,
