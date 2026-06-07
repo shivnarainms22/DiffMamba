@@ -162,6 +162,7 @@ def _vlm_eval(config, logger, tokenizer):
         rows.append({'question': q, 'gold': gold, 'generated': gen,
                      'exact': is_exact, 'recall': is_recall})
 
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
     out_path = os.path.join(config.checkpointing.save_dir, 'vlm_eval.json')
     summary = {'n': n_eval, 'exact_match': exact / n_eval,
                'gold_recall': recall / n_eval, 'sampling_steps': steps}
@@ -291,6 +292,7 @@ def _gen_eval(config, logger, tokenizer):
     summary = {'n': n, 'clip_matched': matched,
                'clip_mismatched_shuffled': mismatched,
                'sampling_steps': config.sampling.steps}
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
     out = os.path.join(config.checkpointing.save_dir, 'gen_eval.json')
     json.dump(summary, open(out, 'w'), indent=2)
     print(f'Gen CLIP-score (n={n}): matched={matched:.3f} vs '
@@ -400,6 +402,7 @@ def _uni_eval(config, logger, tokenizer):
     summary = {'n': n,
                'understand_matched': u_matched, 'understand_shuffled': u_shuffled,
                'generate_matched': g_matched, 'generate_shuffled': g_shuffled}
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
     out_path = os.path.join(config.checkpointing.save_dir, 'uni_eval.json')
     json.dump(summary, open(out_path, 'w'), indent=2)
     print(f'UNIFIED eval (n={n}):')
@@ -504,6 +507,7 @@ def _uni_vqa_eval(config, logger, tokenizer):
 
     summary = summarize_vqa_rows(rows, sampling_steps=steps)
     summary['checkpoint'] = config.eval.checkpoint_path
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
     out_path = os.path.join(config.checkpointing.save_dir, 'uni_vqa_eval.json')
     json.dump({'summary': summary, 'rows': rows}, open(out_path, 'w'), indent=2)
 
@@ -619,6 +623,7 @@ def _vlm_caption_eval(config, logger, tokenizer):
     summary = {'n': n, 'understand_matched': matched,
                'understand_shuffled': shuffled, 'sampling_steps': steps,
                'checkpoint': config.eval.checkpoint_path}
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
     out_path = os.path.join(config.checkpointing.save_dir, 'vlm_caption_eval.json')
     json.dump(summary, open(out_path, 'w'), indent=2)
     print(f'STANDALONE caption baseline (n={n}): '
