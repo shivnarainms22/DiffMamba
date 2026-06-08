@@ -34,7 +34,7 @@ def parse_args():
     p.add_argument('--checkpoint', type=str, required=True,
                    help='Path to Lightning .ckpt file.')
     p.add_argument('--backbone', type=str, required=True,
-                   choices=['dimamba', 'dit'],
+                   choices=['dimamba', 'dit', 'hybrid_dimamba'],
                    help='Backbone type the checkpoint was trained with.')
     p.add_argument('--seq-lens', type=int, nargs='+',
                    default=[512, 1024, 2048, 4096, 8192])
