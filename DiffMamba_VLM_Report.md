@@ -272,18 +272,33 @@ Practical operating point **`cfg_scale≈3.0`** (clear conditioning gain before 
 4.0). Code: `cfg_utils.py`, `gen_diffusion.py`/`unified_diffusion.py` (`_guided_image_forward`),
 `configs/experiment/gen_stage2_cfg.yaml`.
 
-### 11.2 Hybrid Mamba+attention backbone (in progress)
+### 11.2 Hybrid Mamba+attention backbone (matches Transformer perplexity, beats BiMamba)
 
-Opt-in backbone (`backbone: hybrid_dimamba`) that inserts full bidirectional attention on a fixed
-schedule (every 4th block: layers 3/7/11 of 12) among the bidirectional Mamba blocks, to test
-whether sparse attention recovers DiT-class quality while keeping more of Mamba's long-context
-efficiency. Constructs and runs (CUDA smoke test passes). A 130M run (`hybrid_130m`, same
-OpenWebText / dims / 76k-step recipe as the BiMamba baseline `runD_130m`) is training.
+Opt-in backbone (`backbone: hybrid_dimamba`) inserts full bidirectional attention on a fixed
+schedule (every 4th block: layers 3/7/11 of 12) among the bidirectional Mamba blocks, testing
+whether sparse attention recovers DiT-class quality while keeping most layers linear-time. A 130M
+run (`hybrid_130m`, same OpenWebText / dims / 76k-step / lr 3e-4 / seed-1 recipe as the BiMamba
+baseline `runD1` and the Transformer `runB`) gives:
 
-*Results pending:* validation NLL/perplexity vs. BiMamba (`runD`) and Transformer (`runB`), and
-forward-pass throughput across `dimamba` / `hybrid_dimamba` / `dit` (`scripts/eval_throughput.py`).
-Code: `models/hybrid_dimamba.py`, `hybrid_schedule.py`, `configs/model/small-hybrid-dimamba.yaml`,
-`configs/experiment/hybrid_130m.yaml`.
+| Backbone (130M, lr 3e-4, seed 1) | Run | Val PPL (↓) |
+|---|---|---|
+| Transformer (DiT) | runB | 70.45 |
+| **Hybrid (9 Mamba + 3 attention)** | **hybrid_130m** | **69.60** |
+| BiMamba-2 | runD1 | 85.91 |
+| BiMamba-2 (tuned lr 1e-3) | runD_lr1e3 | 79.26 |
+
+**Reading it honestly.** With only 3 of 12 layers as attention, the hybrid reaches **69.60** val
+PPL — **statistically matching the full Transformer** (70.45; the 0.85-PPL gap is within the
+~2.4-PPL seed-noise band from §6.2) and **dramatically improving on pure BiMamba** (85.91 → 69.60, a
+16.3-PPL / ~19% drop, far beyond seed noise; it also beats the lr-tuned BiMamba at 79.26 by ~9.7).
+So sparse attention recovers full Transformer-class quality while keeping 9/12 layers as linear-time
+Mamba — the quality half of the trade-off the main report hypothesized (§6, "a hybrid Mamba+attention
+block to recover quality").
+
+*Throughput pending:* forward-pass tokens/sec across `dimamba` / `hybrid_dimamba` / `dit` to quantify
+how much of pure-Mamba's efficiency the hybrid keeps while buying this quality
+(`scripts/eval_throughput.py`). Code: `models/hybrid_dimamba.py`, `hybrid_schedule.py`,
+`configs/model/small-hybrid-dimamba.yaml`, `configs/experiment/hybrid_130m.yaml`.
 
 ### 11.3 Unified VQA understanding metric (negative result; SFT queued)
 
