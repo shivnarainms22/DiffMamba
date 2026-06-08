@@ -312,7 +312,17 @@ def _uni_train(config, logger, tokenizer):
         ckpt_path = None
 
     train_ds, valid_ds = unified_dataloader.get_unified_dataloaders(config, tokenizer)
-    model = UnifiedDiffusion(config, tokenizer=tokenizer)
+    warmstart = config.vlm.get('unified_warmstart_path', '')
+    if warmstart and ckpt_path is None:
+        # SFT: load full unified weights (backbone+projector+noise+EMA) from a prior
+        # unified checkpoint; fresh optimizer/step (trainer.fit ckpt_path stays None).
+        # NOTE: the warm-start config (uni_vqa_sft.yaml) empties vlm.warmstart_path and
+        # vlm.projector_warmstart_path so __init__'s PARTIAL warm-starts are skipped —
+        # this full checkpoint load supplies all weights. Keep them empty alongside
+        # unified_warmstart_path, else the partial loads fire and are clobbered here.
+        model = UnifiedDiffusion.load_from_checkpoint(warmstart, config=config, tokenizer=tokenizer)
+    else:
+        model = UnifiedDiffusion(config, tokenizer=tokenizer)
 
     trainer = hydra.utils.instantiate(
         config.trainer,

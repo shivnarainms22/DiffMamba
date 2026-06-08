@@ -18,8 +18,20 @@ def _understanding_view(config):
     cfg = copy.deepcopy(config)
     with open_dict(cfg):
         cfg.vlm.num_image_tokens = config.vlm.siglip_tokens
-        cfg.vlm.text_len = config.vlm.caption_len
-        cfg.vlm.label_as_caption = False
+        if config.vlm.get('understand_task', 'caption') == 'vqa':
+            v = config.vlm
+            cfg.vlm.dataset = v.get('vqa_dataset', 'lmms-lab/VQAv2')
+            cfg.vlm.split = v.get('vqa_split', 'validation')
+            cfg.vlm.image_column = v.get('vqa_image_column', 'image')
+            cfg.vlm.caption_column = v.get('vqa_caption_column', 'multiple_choice_answer')
+            cfg.vlm.question_column = v.get('vqa_question_column', 'question')
+            cfg.vlm.text_len = v.get('vqa_text_len', v.caption_len)
+            cfg.vlm.max_examples = v.get('vqa_max_examples', 40000)
+            cfg.vlm.streaming = True
+            cfg.vlm.label_as_caption = False
+        else:
+            cfg.vlm.text_len = config.vlm.caption_len
+            cfg.vlm.label_as_caption = False
     return cfg
 
 
