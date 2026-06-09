@@ -325,7 +325,7 @@ BiMamba and Transformer backbones (§6). Code: `models/hybrid_dimamba.py`, `hybr
 `configs/model/small-hybrid-dimamba.yaml`, `configs/experiment/hybrid_130m.yaml`,
 `scripts/eval_throughput.py`.
 
-### 11.3 Unified VQA understanding metric (negative result; SFT queued)
+### 11.3 Unified VQA understanding — SFT teaches *answering*, an ablation proves it's *blind*
 
 To give the unified model's *understanding* direction a dynamic-range metric (§9.2's caption-CLIP
 floor could not resolve it), `mode=uni_vqa_eval` scores short VQAv2-style answers (exact match +
@@ -340,10 +340,46 @@ single fixed prompt, so it has **zero zero-shot question-answering ability** —
 by construction. (The same dump also shows the captioner leaking VQ image-code tokens into the text
 answer region, corroborating §9.2's at-floor understanding.)
 
-**Net:** the unified Stage-3 checkpoint cannot be VQA-probed as-is; a dynamic-range understanding
-number requires *training* for it. Queued next: a short **unified VQA-SFT** (mix VQAv2 Q→A pairs into
-the understanding stream, as Stage-1 did), after which `uni_vqa_eval` becomes meaningful. Code:
-`vlm_eval_utils.py`, `main_vlm.py` (`_uni_vqa_eval`, `_uni_vqa_diag`).
+So the `uni_stage3` checkpoint cannot be VQA-probed as-is; a dynamic-range number requires *training*
+for it.
+
+**Unified VQA-SFT (Stage 3.5).** Joint SFT warm-started from `uni_stage3`: the understanding stream
+switches to VQAv2 (question → `multiple_choice_answer`), the generation stream stays on CC3M, all
+weights loaded with a fresh optimizer, 8000 steps @ lr 2e-4 (`+experiment=uni_vqa_sft`). Held-out
+eval (VQAv2 `validation` tail slice, never trained on), n=200:
+
+| Metric | uni_stage3 (pre-SFT) | uni_vqa_sft (post-SFT) |
+|---|---|---|
+| answers | empty (EOS-first) | **non-empty** |
+| exact-match, correct image | 0.000 | **0.265** |
+| exact-match, shuffled image | 0.000 | 0.285 |
+| **image delta (correct − shuffled)** | 0.000 | **−0.020** |
+| generation (gen image vs caption, CLIP, matched / shuffled) | 0.194 / 0.197 | **0.199 / 0.199** |
+
+**The SFT works mechanically, but the model answers blind.** Post-SFT the model produces fluent VQA
+answers and hits **0.265 exact-match** (≈ Stage-1's 0.29), and **generation is preserved** (0.199 ≈
+the pre-SFT 0.194). But the **image delta is ≈ 0** (−0.020, within ~1 SE at n=200). A blind model
+scores ~25–30% on VQAv2 by exploiting language priors, and the ablation shows that is exactly what is
+happening here.
+
+**Proof the image is ignored (not a noisy ablation).** The shuffled-image control initially paired
+example *i* with *i+1*'s image — invalid, because VQAv2 stores several questions per image
+consecutively, so *i+1* often *is* the same image. After fixing the ablation to use a
+guaranteed-different image (offset ≈ half the eval set), the result was **byte-identical** to the
+broken version. Diffing the two runs' generated answers: **200/200 identical** for both the matched
+*and* the shuffled set — i.e. swapping in a completely different image changes **zero** of 200
+answers. The image features therefore have **no effect on the model's output**; the 0.265 is **pure
+language prior**, and the −0.020 "delta" is just RNG between the two sampling passes.
+
+**Net.** The unified model can be taught to *answer* VQA (format learned, EOS-first cured, generation
+preserved) — a genuine dynamic-range understanding signal where there was none — but at 130M it
+acquires the VQAv2 **language-prior shortcut rather than visual grounding**: the answers are blind.
+This also **re-frames Stage-1's 0.29**, which was reported *without* a shuffled-image ablation and is
+therefore likely substantially language-prior too — the ablation introduced here is the rigor that
+exposes it. Closing the grounding gap (e.g. balanced/complementary-pair VQA, contrastive
+image-reliance objectives, larger scale) is the real open problem and is left as future work. Code:
+`unified_dataloader.py` (`understand_task`), `main_vlm.py` (`_uni_train` warm-start, `_uni_vqa_eval`,
+`_uni_vqa_diag`), `configs/experiment/uni_vqa_sft.yaml`.
 
 ## Reproduce
 
