@@ -492,7 +492,12 @@ def _uni_vqa_eval(config, logger, tokenizer):
             prompt_ids = torch.tensor(prompt, device='cuda')[None]
 
             feats = ds[i]['image_features'][None].to('cuda')
-            shuffled_feats = ds[(i + 1) % n_eval]['image_features'][None].to('cuda')
+            # Ablation image must be a DIFFERENT image. VQAv2 stores several
+            # questions per image consecutively, so the adjacent example (i+1)
+            # often shares i's image -> a no-op "shuffle". Offset by ~half the
+            # eval set to guarantee a different image_id.
+            shuf_idx = (i + max(1, n_eval // 2)) % n_eval
+            shuffled_feats = ds[shuf_idx]['image_features'][None].to('cuda')
 
             out = model._sample_caption(
                 feats, prompt_ids, num_steps=steps)
