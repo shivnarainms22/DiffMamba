@@ -39,6 +39,31 @@ def _build():
     return UnifiedDiffusion(cfg, tokenizer=tok).cuda()
 
 
+def test_contrastive_and_scale_match_run_finite():
+    """Smoke: with scale_match + contrastive flags on, the understanding
+    contrastive term is finite and backprops. CUDA-only (skipped on CPU CI)."""
+    from omegaconf import open_dict
+    with initialize_config_dir(version_base=None, config_dir=_CONFIGS):
+        cfg = compose(config_name='config', overrides=_TINY)
+    with open_dict(cfg):
+        cfg.vlm.proj_scale_match = True
+        cfg.vlm.contrastive_weight = 0.5
+        cfg.vlm.num_neg = 1
+    tok = transformers.AutoTokenizer.from_pretrained('gpt2')
+    if tok.pad_token is None:
+        tok.add_special_tokens({'pad_token': '[PAD]'})
+    model = UnifiedDiffusion(cfg, tokenizer=tok).cuda()
+    assert model.projector.out_norm is not None
+    b, length = 2, model.config.vlm.caption_len + 4
+    x0 = torch.randint(0, model.vocab_size, (b, length), device='cuda')
+    loss_mask = torch.ones(b, length, device='cuda')
+    feats = torch.randn(b, model.siglip_tokens, model.config.vlm.vision_dim,
+                        device='cuda')
+    lc = model._understand_contrastive(x0, loss_mask, feats, num_neg=1)
+    assert torch.isfinite(lc)
+    lc.backward()
+
+
 def _u_batch(model, B=2, L=8, N=5, Dv=64):
     ids = torch.randint(0, 50257, (B, L), device='cuda')
     attn = torch.ones(B, L, device='cuda')
