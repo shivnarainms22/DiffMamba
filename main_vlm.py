@@ -622,8 +622,8 @@ def _uni_grounding_diag(config, logger, tokenizer):
         x[:, :p] = prompt_ids
         return x, p
 
-    def _first_sigma(b):
-        st = model.noise(torch.ones(b, 1, device='cuda'))[0]
+    def _sigma_at(t_val, b=1):
+        st = model.noise(t_val * torch.ones(b, 1, device='cuda'))[0]
         return st.squeeze(-1) if st.ndim > 1 else st
 
     # ---- Probe A: connector collapse across DISTINCT images ----
@@ -637,9 +637,14 @@ def _uni_grounding_diag(config, logger, tokenizer):
     ref_scale = model.backbone.model.get_input_embeddings().weight.float().std().item()
     probe_a = image_prefix_variation(proj, ref_scale=ref_scale)
 
-    # ---- Probe B: logit sensitivity to the image (sampler-free) ----
+    # ---- Probe B: distribution sensitivity to the image, across timesteps ----
+    # `_forward_understand` returns SUBS log-probs, so only sym_kl is meaningful
+    # (a raw L2 is dominated by the large-negative mask-token fill and cancels in
+    # the distribution -> dropped). Sweep several noise levels so a single
+    # max-noise timestep can't hide image dependence that only shows at refinement.
     n_b = min(8, n_probe)
-    ab, a0 = [], []
+    t_grid = [0.8, 0.5, 0.2]
+    per_t = {t: {'ab': [], 'a0': []} for t in t_grid}
     with torch.no_grad():
         for i in range(n_b):
             rec = ds.text_records[i]
@@ -647,40 +652,56 @@ def _uni_grounding_diag(config, logger, tokenizer):
                 rec['prompt'], add_special_tokens=False)
             prompt_ids = torch.tensor(prompt, device='cuda')[None]
             x, p = _masked_state(prompt_ids)
-            st = _first_sigma(1)
 
             featsA = ds[i]['image_features'][None].to('cuda')
             shuf = (i + max(1, n_b // 2)) % n_b
             featsB = ds[shuf]['image_features'][None].to('cuda')
             zeros = torch.zeros_like(featsA)
 
-            lpA = model._forward_understand(x, st[:, None], featsA)[:, p:, :]
-            lpB = model._forward_understand(x, st[:, None], featsB)[:, p:, :]
-            lp0 = model._forward_understand(x, st[:, None], zeros)[:, p:, :]
-            ab.append(logit_distribution_shift(lpA[0], lpB[0]))
-            a0.append(logit_distribution_shift(lpA[0], lp0[0]))
+            for tv in t_grid:
+                st = _sigma_at(tv)
+                lpA = model._forward_understand(x, st[:, None], featsA)[:, p:, :]
+                lpB = model._forward_understand(x, st[:, None], featsB)[:, p:, :]
+                lp0 = model._forward_understand(x, st[:, None], zeros)[:, p:, :]
+                per_t[tv]['ab'].append(
+                    logit_distribution_shift(lpA[0], lpB[0])['sym_kl'])
+                per_t[tv]['a0'].append(
+                    logit_distribution_shift(lpA[0], lp0[0])['sym_kl'])
 
     def _avg(rows, key):
         return sum(r[key] for r in rows) / max(1, len(rows))
 
+    def _mean(xs):
+        return sum(xs) / max(1, len(xs))
+
+    by_t = {f't={t}': {'ab_sym_kl': _mean(per_t[t]['ab']),
+                       'a0_sym_kl': _mean(per_t[t]['a0'])} for t in t_grid}
     probe_b = {
         'n': n_b,
-        'image_a_vs_b': {'l2': _avg(ab, 'l2'), 'sym_kl': _avg(ab, 'sym_kl')},
-        'image_a_vs_zero': {'l2': _avg(a0, 'l2'), 'sym_kl': _avg(a0, 'sym_kl')},
+        'by_timestep': by_t,
+        # If the image matters at ANY noise level, the max is > 0.
+        'max_ab_sym_kl': max(_mean(per_t[t]['ab']) for t in t_grid),
+        'max_a0_sym_kl': max(_mean(per_t[t]['a0']) for t in t_grid),
     }
 
     # ---- Probe C: gradient saliency, image prefix vs text ----
     # Reconstruct _forward_understand (unified_diffusion.py:99-110) with the image
-    # and text embeds as leaves so backward populates their grads.
+    # and text embeds as leaves, then backprop the GOLD-answer cross-entropy.
+    # CE grad = (softmax - onehot) is non-saturating (unlike max-log-softmax, which
+    # is ~0 when the model is confident and zeroes BOTH grads), so this faithfully
+    # measures how much the training objective depends on the image vs the text.
     n_c = min(4, n_probe)
     ratios = []
     for i in range(n_c):
         rec = ds.text_records[i]
+        gold_ids = tokenizer.encode(rec['answer'], add_special_tokens=False)
+        if not gold_ids:
+            continue
         prompt = [tokenizer.bos_token_id] + tokenizer.encode(
             rec['prompt'], add_special_tokens=False)
         prompt_ids = torch.tensor(prompt, device='cuda')[None]
         x, p = _masked_state(prompt_ids)
-        st = _first_sigma(1)
+        st = _sigma_at(0.5)  # mid-noise: answer region partly informative
         feats = ds[i]['image_features'][None].to('cuda')
 
         with torch.cuda.amp.autocast(dtype=torch.float32):
@@ -696,32 +717,37 @@ def _uni_grounding_diag(config, logger, tokenizer):
             logits = model.backbone.model(
                 inputs_embeds=fused, time_embeds=c).logits
             logits = slice_text_logits(logits, siglip)
-            ans = torch.log_softmax(logits[:, p:, :], dim=-1)
-            scalar = ans.max(dim=-1).values.sum()
+            ans = logits[:, p:, :]
+            tgt_len = min(len(gold_ids), ans.shape[1])
+            tgt = torch.tensor(gold_ids[:tgt_len], device='cuda')
+            scalar = torch.nn.functional.cross_entropy(ans[0, :tgt_len, :], tgt)
         model.zero_grad(set_to_none=True)
         scalar.backward()
         ratios.append(grad_norm_ratio(img.grad, text_embeds.grad))
 
     probe_c = {
-        'n': n_c,
+        'n': len(ratios),
         'image_grad_norm': _avg(ratios, 'image_grad_norm'),
         'text_grad_norm': _avg(ratios, 'text_grad_norm'),
         'image_to_text_ratio': _avg(ratios, 'image_to_text_ratio'),
     }
 
     # ---- Verdict (heuristic; raw numbers are the ground truth) ----
+    img_invariant = probe_b['max_ab_sym_kl'] < 1e-3
+    grad_dead = probe_c['image_to_text_ratio'] < 0.05
     if (probe_a['mean_pairwise_cosine'] > 0.98
             and probe_a.get('std_vs_ref', 1.0) < 0.05):
         verdict = ('CONNECTOR COLLAPSE (Probe A): projector maps distinct images '
                    'to ~one vector -> re-align the projector.')
-    elif (probe_b['image_a_vs_b']['sym_kl'] < 1e-3
-          and probe_c['image_to_text_ratio'] < 0.05):
+    elif img_invariant and grad_dead:
         verdict = ('BACKBONE IGNORES PREFIX (B+C): connector varies but the answer '
-                   'is image-invariant and carries ~no gradient to the image -> '
-                   'conditioning/objective fix (image-token loss weight / longer SFT).')
-    elif probe_b['image_a_vs_b']['sym_kl'] >= 1e-3:
-        verdict = ('SIGNAL EXISTS, DECODE WASHES OUT (B): logits move with the image '
-                   'yet sampling was image-invariant -> sampler/loss fix, maybe no retrain.')
+                   'is image-invariant at every timestep AND the objective carries '
+                   '~no gradient to the image -> conditioning/objective fix '
+                   '(image-token loss weight / scale-match projector / longer SFT).')
+    elif not img_invariant:
+        verdict = ('SIGNAL EXISTS, DECODE WASHES OUT (B): the distribution moves with '
+                   'the image yet sampling was image-invariant -> sampler/loss fix, '
+                   'maybe no retrain.')
     else:
         verdict = ('INCONCLUSIVE: inspect raw numbers; thresholds are heuristic.')
 
@@ -738,18 +764,19 @@ def _uni_grounding_diag(config, logger, tokenizer):
         config.checkpointing.save_dir, 'uni_grounding_diag.json')
     json.dump(summary, open(out_path, 'w'), indent=2)
 
-    print('GROUNDING DIAGNOSTIC (read-only, frozen uni_stage3):')
+    print('GROUNDING DIAGNOSTIC (read-only, frozen checkpoint):')
     print(f'  [A] connector: pairwise_cosine={probe_a["mean_pairwise_cosine"]:.4f}  '
           f'feature_std={probe_a["mean_feature_std"]:.4f}  '
           f'std_vs_ref={probe_a.get("std_vs_ref", float("nan")):.4f}  '
-          f'(cosine~1 / std~0 => connector dead)')
-    print(f'  [B] logit shift A-vs-B:    sym_kl={probe_b["image_a_vs_b"]["sym_kl"]:.4f}  '
-          f'l2={probe_b["image_a_vs_b"]["l2"]:.4f}')
-    print(f'      logit shift A-vs-zero: sym_kl={probe_b["image_a_vs_zero"]["sym_kl"]:.4f}  '
-          f'l2={probe_b["image_a_vs_zero"]["l2"]:.4f}  (~0 => image ignored at logits)')
-    print(f'  [C] grad ratio image/text={probe_c["image_to_text_ratio"]:.4f}  '
+          f'(cosine~1 / std~0 => connector dead; std_vs_ref>>1 => scale mismatch)')
+    print(f'  [B] image sensitivity (sym_kl, max over t): '
+          f'A-vs-B={probe_b["max_ab_sym_kl"]:.4f}  A-vs-zero={probe_b["max_a0_sym_kl"]:.4f} '
+          f'(~0 => image ignored at output)')
+    for tname, vals in probe_b['by_timestep'].items():
+        print(f'        {tname}: ab={vals["ab_sym_kl"]:.4f}  a0={vals["a0_sym_kl"]:.4f}')
+    print(f'  [C] gold-CE grad ratio image/text={probe_c["image_to_text_ratio"]:.4f}  '
           f'(img={probe_c["image_grad_norm"]:.4f} txt={probe_c["text_grad_norm"]:.4f}; '
-          f'~0 => attention-dead prefix)')
+          f'~0 => objective carries no signal to the image)')
     print(f'  => {verdict}')
     print(f'  written {out_path}')
 
