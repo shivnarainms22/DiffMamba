@@ -1,0 +1,33 @@
+# @package _global_
+#
+# Grounding retrain (Stage 3.6): make the unified model answer VQA USING the
+# image. Inherits uni_vqa_sft's proven data path (VQAv2 labeled pool, held-out
+# tail eval, CC3M generation). Adds: projector scale-match + in-batch image
+# contrastive loss, and up-weights the understanding stream. Warm-starts ALL
+# weights from the uni_vqa_sft checkpoint.
+#
+# Usage (GPU node): python main_vlm.py +experiment=uni_grounding
+#
+# Spec: docs/superpowers/specs/2026-06-11-grounding-retrain-design.md
+
+defaults:
+  - uni_vqa_sft
+
+vlm:
+  proj_scale_match: true
+  contrastive_weight: 0.5
+  num_neg: 1
+  understand_weight: 2.0   # prioritize the image pathway; generate stays 1.0
+  unified_warmstart_path: /scratch/sarin.s/DiffMamba/runs/uni_vqa_sft/checkpoints/best.ckpt
+
+checkpointing:
+  save_dir: /scratch/sarin.s/DiffMamba/runs/uni_grounding
+
+trainer:
+  max_steps: 8000
+
+optim:
+  lr: 2e-4
+
+wandb:
+  name: uni_grounding

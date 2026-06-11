@@ -31,6 +31,11 @@ vlm:
   generate_weight: 1.0
   text_weight: 0.0
 
+  # grounding retrain (off by default; uni_grounding.yaml turns them on)
+  proj_scale_match: false   # RMSNorm the projector output to the text-embed scale
+  contrastive_weight: 0.0   # weight of the in-batch image-contrastive loss
+  num_neg: 1                # negatives per example for the contrastive loss
+
   # CC3M, used BOTH directions (match max_examples to gen_stage2 to reuse its VQ cache)
   dataset: pixparse/cc3m-wds
   split: train
