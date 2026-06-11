@@ -732,6 +732,76 @@ def _uni_grounding_diag(config, logger, tokenizer):
         'image_to_text_ratio': _avg(ratios, 'image_to_text_ratio'),
     }
 
+    # ---- Probe D: scale-match pre-check ----
+    # Probe A showed the projected prefix runs ~24x the text-embed scale. Re-feed
+    # the SAME frozen projector output rescaled to the text-embed std and re-measure
+    # output sensitivity (B-style sym_kl, swap-confound-free) and gold-CE gradient
+    # (C-style). If matched-scale lifts these from ~0, the scale mismatch is a
+    # dominant bottleneck and the retrain must scale-match the projector; if not,
+    # the gradient starvation is objective/data-driven (prioritize contrastive /
+    # up-weighting instead).
+    text_std = model.backbone.model.get_input_embeddings().weight.float().std()
+
+    def _recon(x, p, feats, match, want_grad):
+        ctx = torch.enable_grad() if want_grad else torch.no_grad()
+        st = _sigma_at(0.5)
+        with ctx, torch.cuda.amp.autocast(dtype=torch.float32):
+            sigma = model._process_sigma(st[:, None])
+            c = None
+            if model.backbone.temb_strategy is not None:
+                c = torch.nn.functional.silu(model.backbone.sigma_map(sigma))
+            text_embeds = model.backbone.model.get_input_embeddings()(x)
+            img = model.projector(feats.to(pdtype)).to(text_embeds.dtype)
+            if match:  # rescale THIS image's prefix to the text-embed std
+                s = text_std / (img.float().std() + 1e-8)
+                img = img * s.to(img.dtype)
+            if want_grad:  # leaf = the tensor as fed, so grad has no scale confound
+                img = img.detach().requires_grad_(True)
+                text_embeds = text_embeds.detach().requires_grad_(True)
+            fused = assemble_mm_embeds(img, text_embeds)
+            logits = slice_text_logits(model.backbone.model(
+                inputs_embeds=fused, time_embeds=c).logits, siglip)
+        return logits, img, text_embeds
+
+    def _scalecheck(match):
+        n_d = min(4, n_probe)
+        kl_ab, kl_a0, gr = [], [], []
+        for i in range(n_d):
+            rec = ds.text_records[i]
+            gold_ids = tokenizer.encode(rec['answer'], add_special_tokens=False)
+            prompt = [tokenizer.bos_token_id] + tokenizer.encode(
+                rec['prompt'], add_special_tokens=False)
+            prompt_ids = torch.tensor(prompt, device='cuda')[None]
+            x, p = _masked_state(prompt_ids)
+            featsA = ds[i]['image_features'][None].to('cuda')
+            shuf = (i + max(1, n_d // 2)) % n_d
+            featsB = ds[shuf]['image_features'][None].to('cuda')
+            zeros = torch.zeros_like(featsA)
+            lA = _recon(x, p, featsA, match, False)[0][:, p:, :]
+            lB = _recon(x, p, featsB, match, False)[0][:, p:, :]
+            l0 = _recon(x, p, zeros, match, False)[0][:, p:, :]
+            kl_ab.append(logit_distribution_shift(lA[0], lB[0])['sym_kl'])
+            kl_a0.append(logit_distribution_shift(lA[0], l0[0])['sym_kl'])
+            if gold_ids:
+                logits, img, txt = _recon(x, p, featsA, match, True)
+                ans = logits[:, p:, :]
+                tl = min(len(gold_ids), ans.shape[1])
+                tgt = torch.tensor(gold_ids[:tl], device='cuda')
+                ce = torch.nn.functional.cross_entropy(ans[0, :tl, :], tgt)
+                model.zero_grad(set_to_none=True)
+                ce.backward()
+                gr.append(grad_norm_ratio(img.grad, txt.grad)['image_to_text_ratio'])
+        return {'sym_kl_ab': _mean(kl_ab), 'sym_kl_a0': _mean(kl_a0),
+                'grad_ratio': _mean(gr)}
+
+    probe_d = {'raw': _scalecheck(False), 'scale_matched': _scalecheck(True)}
+    # Did scale-matching meaningfully wake the image up?
+    d_raw, d_m = probe_d['raw'], probe_d['scale_matched']
+    scale_helps = (
+        d_m['sym_kl_ab'] > max(10 * d_raw['sym_kl_ab'], 1e-3)
+        or d_m['grad_ratio'] > max(10 * d_raw['grad_ratio'], 0.05))
+    probe_d['scale_is_dominant_bottleneck'] = bool(scale_helps)
+
     # ---- Verdict (heuristic; raw numbers are the ground truth) ----
     img_invariant = probe_b['max_ab_sym_kl'] < 1e-3
     grad_dead = probe_c['image_to_text_ratio'] < 0.05
@@ -757,6 +827,7 @@ def _uni_grounding_diag(config, logger, tokenizer):
         'probe_a_connector_variation': probe_a,
         'probe_b_logit_sensitivity': probe_b,
         'probe_c_gradient_saliency': probe_c,
+        'probe_d_scale_match_precheck': probe_d,
         'suggested_reading': verdict,
     }
     os.makedirs(config.checkpointing.save_dir, exist_ok=True)
@@ -777,6 +848,13 @@ def _uni_grounding_diag(config, logger, tokenizer):
     print(f'  [C] gold-CE grad ratio image/text={probe_c["image_to_text_ratio"]:.4f}  '
           f'(img={probe_c["image_grad_norm"]:.4f} txt={probe_c["text_grad_norm"]:.4f}; '
           f'~0 => objective carries no signal to the image)')
+    print(f'  [D] scale-match pre-check (does rescaling the prefix to text scale wake it up?)')
+    print(f'        raw     : sym_kl_ab={d_raw["sym_kl_ab"]:.4f}  '
+          f'sym_kl_a0={d_raw["sym_kl_a0"]:.4f}  grad_ratio={d_raw["grad_ratio"]:.4f}')
+    print(f'        matched : sym_kl_ab={d_m["sym_kl_ab"]:.4f}  '
+          f'sym_kl_a0={d_m["sym_kl_a0"]:.4f}  grad_ratio={d_m["grad_ratio"]:.4f}')
+    print(f'        => scale mismatch is a DOMINANT bottleneck: '
+          f'{probe_d["scale_is_dominant_bottleneck"]}')
     print(f'  => {verdict}')
     print(f'  written {out_path}')
 
