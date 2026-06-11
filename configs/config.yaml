@@ -52,6 +52,7 @@ eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
   disable_ema: False
   num_eval: 200  # held-out examples scored by uni_vqa_eval / uni_eval
+  num_probe: 16  # distinct images probed by uni_grounding_diag (A/B/C)
   compute_generative_perplexity: False
   perplexity_batch_size: 8
   compute_perplexity_on_sanity: False

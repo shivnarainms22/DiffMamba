@@ -41,6 +41,8 @@ from gen_diffusion import GenDiffusion
 from mm_diffusion import MMDiffusion
 from unified_diffusion import UnifiedDiffusion
 from vlm_eval_utils import score_vqa_answer, summarize_vqa_rows
+from grounding_diag_utils import (
+    grad_norm_ratio, image_prefix_variation, logit_distribution_shift)
 
 omegaconf.OmegaConf.register_new_resolver('cwd', os.getcwd)
 omegaconf.OmegaConf.register_new_resolver(
@@ -580,6 +582,178 @@ def _uni_vqa_diag(config, logger, tokenizer):
                   f'decoded={_decode_answer(tokenizer, cout)!r}')
 
 
+def _uni_grounding_diag(config, logger, tokenizer):
+    """Localize WHERE image grounding fails, read-only on the frozen ckpt.
+
+    The behavioral shuffle (uni_vqa_eval) proved the model answers VQA blind but
+    not *why*. Three probes triangulate the failure (see
+    docs/superpowers/specs/2026-06-10-grounding-diagnostic-scope.md):
+
+      A connector collapse -> does the projector map distinct images to distinct
+        prefixes, or to ~one vector? (cosine ~1 / std ~0 == dead)
+      B logit sensitivity  -> swapping the image (A vs B vs zeroed), sampler-free,
+        does the answer-region distribution actually move?
+      C gradient saliency  -> does the answer log-prob carry gradient back to the
+        image prefix at all, vs the text? (ratio ~0 == attention-dead prefix)
+
+    Every probe runs on uni_stage3/best.ckpt with no training. The result picks
+    which retrain is justified, so we don't spend GPU guessing.
+    """
+    import json
+
+    from models.mm_ops import assemble_mm_embeds, slice_text_logits
+
+    model = _load_unified_eval_model(config, tokenizer)
+    _, valid_ds = mm_dataloader.get_mm_dataloaders(
+        _unified_vqa_view(config), tokenizer)
+    ds = valid_ds.dataset
+    steps = config.sampling.steps
+    siglip = config.vlm.siglip_tokens
+    n_probe = min(len(ds), int(config.eval.get('num_probe', 16)))
+    pdtype = next(model.projector.parameters()).dtype
+
+    def _masked_state(prompt_ids):
+        """Initial caption state: prompt fixed, answer region all MASK (mirrors
+        _sample_caption)."""
+        b, p = prompt_ids.shape
+        length = config.vlm.caption_len + 8
+        x = torch.full((b, p + length), model.mask_index,
+                       dtype=torch.long, device='cuda')
+        x[:, :p] = prompt_ids
+        return x, p
+
+    def _first_sigma(b):
+        st = model.noise(torch.ones(b, 1, device='cuda'))[0]
+        return st.squeeze(-1) if st.ndim > 1 else st
+
+    # ---- Probe A: connector collapse across DISTINCT images ----
+    # VQAv2 groups questions per image; stride the indices to hit different images.
+    k = min(n_probe, len(ds))
+    stride = max(1, len(ds) // k)
+    a_idxs = [(j * stride) % len(ds) for j in range(k)]
+    with torch.no_grad():
+        feats_k = torch.stack([ds[i]['image_features'] for i in a_idxs]).to('cuda')
+        proj = model.projector(feats_k.to(pdtype))  # (K, N, D)
+    ref_scale = model.backbone.model.get_input_embeddings().weight.float().std().item()
+    probe_a = image_prefix_variation(proj, ref_scale=ref_scale)
+
+    # ---- Probe B: logit sensitivity to the image (sampler-free) ----
+    n_b = min(8, n_probe)
+    ab, a0 = [], []
+    with torch.no_grad():
+        for i in range(n_b):
+            rec = ds.text_records[i]
+            prompt = [tokenizer.bos_token_id] + tokenizer.encode(
+                rec['prompt'], add_special_tokens=False)
+            prompt_ids = torch.tensor(prompt, device='cuda')[None]
+            x, p = _masked_state(prompt_ids)
+            st = _first_sigma(1)
+
+            featsA = ds[i]['image_features'][None].to('cuda')
+            shuf = (i + max(1, n_b // 2)) % n_b
+            featsB = ds[shuf]['image_features'][None].to('cuda')
+            zeros = torch.zeros_like(featsA)
+
+            lpA = model._forward_understand(x, st[:, None], featsA)[:, p:, :]
+            lpB = model._forward_understand(x, st[:, None], featsB)[:, p:, :]
+            lp0 = model._forward_understand(x, st[:, None], zeros)[:, p:, :]
+            ab.append(logit_distribution_shift(lpA[0], lpB[0]))
+            a0.append(logit_distribution_shift(lpA[0], lp0[0]))
+
+    def _avg(rows, key):
+        return sum(r[key] for r in rows) / max(1, len(rows))
+
+    probe_b = {
+        'n': n_b,
+        'image_a_vs_b': {'l2': _avg(ab, 'l2'), 'sym_kl': _avg(ab, 'sym_kl')},
+        'image_a_vs_zero': {'l2': _avg(a0, 'l2'), 'sym_kl': _avg(a0, 'sym_kl')},
+    }
+
+    # ---- Probe C: gradient saliency, image prefix vs text ----
+    # Reconstruct _forward_understand (unified_diffusion.py:99-110) with the image
+    # and text embeds as leaves so backward populates their grads.
+    n_c = min(4, n_probe)
+    ratios = []
+    for i in range(n_c):
+        rec = ds.text_records[i]
+        prompt = [tokenizer.bos_token_id] + tokenizer.encode(
+            rec['prompt'], add_special_tokens=False)
+        prompt_ids = torch.tensor(prompt, device='cuda')[None]
+        x, p = _masked_state(prompt_ids)
+        st = _first_sigma(1)
+        feats = ds[i]['image_features'][None].to('cuda')
+
+        with torch.cuda.amp.autocast(dtype=torch.float32):
+            sigma = model._process_sigma(st[:, None])
+            c = None
+            if model.backbone.temb_strategy is not None:
+                c = torch.nn.functional.silu(model.backbone.sigma_map(sigma))
+            text_embeds = model.backbone.model.get_input_embeddings()(
+                x).detach().requires_grad_(True)
+            img = model.projector(feats.to(pdtype)).to(
+                text_embeds.dtype).detach().requires_grad_(True)
+            fused = assemble_mm_embeds(img, text_embeds)
+            logits = model.backbone.model(
+                inputs_embeds=fused, time_embeds=c).logits
+            logits = slice_text_logits(logits, siglip)
+            ans = torch.log_softmax(logits[:, p:, :], dim=-1)
+            scalar = ans.max(dim=-1).values.sum()
+        model.zero_grad(set_to_none=True)
+        scalar.backward()
+        ratios.append(grad_norm_ratio(img.grad, text_embeds.grad))
+
+    probe_c = {
+        'n': n_c,
+        'image_grad_norm': _avg(ratios, 'image_grad_norm'),
+        'text_grad_norm': _avg(ratios, 'text_grad_norm'),
+        'image_to_text_ratio': _avg(ratios, 'image_to_text_ratio'),
+    }
+
+    # ---- Verdict (heuristic; raw numbers are the ground truth) ----
+    if (probe_a['mean_pairwise_cosine'] > 0.98
+            and probe_a.get('std_vs_ref', 1.0) < 0.05):
+        verdict = ('CONNECTOR COLLAPSE (Probe A): projector maps distinct images '
+                   'to ~one vector -> re-align the projector.')
+    elif (probe_b['image_a_vs_b']['sym_kl'] < 1e-3
+          and probe_c['image_to_text_ratio'] < 0.05):
+        verdict = ('BACKBONE IGNORES PREFIX (B+C): connector varies but the answer '
+                   'is image-invariant and carries ~no gradient to the image -> '
+                   'conditioning/objective fix (image-token loss weight / longer SFT).')
+    elif probe_b['image_a_vs_b']['sym_kl'] >= 1e-3:
+        verdict = ('SIGNAL EXISTS, DECODE WASHES OUT (B): logits move with the image '
+                   'yet sampling was image-invariant -> sampler/loss fix, maybe no retrain.')
+    else:
+        verdict = ('INCONCLUSIVE: inspect raw numbers; thresholds are heuristic.')
+
+    summary = {
+        'checkpoint': config.eval.checkpoint_path,
+        'sampling_steps': steps,
+        'probe_a_connector_variation': probe_a,
+        'probe_b_logit_sensitivity': probe_b,
+        'probe_c_gradient_saliency': probe_c,
+        'suggested_reading': verdict,
+    }
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
+    out_path = os.path.join(
+        config.checkpointing.save_dir, 'uni_grounding_diag.json')
+    json.dump(summary, open(out_path, 'w'), indent=2)
+
+    print('GROUNDING DIAGNOSTIC (read-only, frozen uni_stage3):')
+    print(f'  [A] connector: pairwise_cosine={probe_a["mean_pairwise_cosine"]:.4f}  '
+          f'feature_std={probe_a["mean_feature_std"]:.4f}  '
+          f'std_vs_ref={probe_a.get("std_vs_ref", float("nan")):.4f}  '
+          f'(cosine~1 / std~0 => connector dead)')
+    print(f'  [B] logit shift A-vs-B:    sym_kl={probe_b["image_a_vs_b"]["sym_kl"]:.4f}  '
+          f'l2={probe_b["image_a_vs_b"]["l2"]:.4f}')
+    print(f'      logit shift A-vs-zero: sym_kl={probe_b["image_a_vs_zero"]["sym_kl"]:.4f}  '
+          f'l2={probe_b["image_a_vs_zero"]["l2"]:.4f}  (~0 => image ignored at logits)')
+    print(f'  [C] grad ratio image/text={probe_c["image_to_text_ratio"]:.4f}  '
+          f'(img={probe_c["image_grad_norm"]:.4f} txt={probe_c["text_grad_norm"]:.4f}; '
+          f'~0 => attention-dead prefix)')
+    print(f'  => {verdict}')
+    print(f'  written {out_path}')
+
+
 def _vlm_caption_eval(config, logger, tokenizer):
     """Baseline for the unified-eval UNDERSTANDING metric.
 
@@ -666,6 +840,9 @@ def main(config):
         return
     if config.mode == 'uni_vqa_diag':
         _uni_vqa_diag(config, logger, tokenizer)
+        return
+    if config.mode == 'uni_grounding_diag':
+        _uni_grounding_diag(config, logger, tokenizer)
         return
     if config.mode == 'vlm_caption_eval':
         _vlm_caption_eval(config, logger, tokenizer)
