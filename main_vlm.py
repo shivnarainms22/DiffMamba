@@ -322,7 +322,16 @@ def _uni_train(config, logger, tokenizer):
         # vlm.projector_warmstart_path so __init__'s PARTIAL warm-starts are skipped —
         # this full checkpoint load supplies all weights. Keep them empty alongside
         # unified_warmstart_path, else the partial loads fire and are clobbered here.
-        model = UnifiedDiffusion.load_from_checkpoint(warmstart, config=config, tokenizer=tokenizer)
+        # Controlled non-strict load: the grounding retrain adds projector.out_norm
+        # (scale-match), which predates the warm-start ckpt and is intentionally
+        # initialized in __init__. Allow ONLY that key to be missing — any other
+        # missing/unexpected key is a real arch mismatch and must fail loudly.
+        model = UnifiedDiffusion(config, tokenizer=tokenizer)
+        sd = torch.load(warmstart, map_location='cpu', weights_only=False)['state_dict']
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        allowed = {k for k in missing if k.startswith('projector.out_norm')}
+        assert set(missing) == allowed, f'unexpected MISSING keys: {set(missing) - allowed}'
+        assert not unexpected, f'unexpected EXTRA keys: {unexpected}'
     else:
         model = UnifiedDiffusion(config, tokenizer=tokenizer)
 
