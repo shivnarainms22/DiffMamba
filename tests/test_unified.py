@@ -54,6 +54,8 @@ def test_contrastive_and_scale_match_run_finite():
         tok.add_special_tokens({'pad_token': '[PAD]'})
     model = UnifiedDiffusion(cfg, tokenizer=tok).cuda()
     assert model.projector.out_norm is not None
+    # scale must be FROZEN (attempt 1 collapsed it to escape grounding pressure)
+    assert model.projector.out_norm.weight.requires_grad is False
     b, length = 2, model.config.vlm.caption_len + 4
     x0 = torch.randint(0, model.vocab_size, (b, length), device='cuda')
     loss_mask = torch.ones(b, length, device='cuda')

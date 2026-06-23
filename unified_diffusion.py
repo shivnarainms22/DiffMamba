@@ -64,12 +64,16 @@ class UnifiedDiffusion(Diffusion):
             pinfo = load_projector_from_mm(self.projector, pws)
             assert pinfo['loaded'] > 0 and pinfo['unexpected'] == 0, pinfo
 
-        # Initialize the scale-match norm so the projected prefix enters at the
-        # text-embed scale (un-throttles the projector gradient; see grounding
-        # diagnostic Probe D). Done post-warmstart so it reflects the loaded rows.
+        # Fix the scale-match norm at the text-embed scale (un-throttles the
+        # projector gradient; see grounding diagnostic Probe D). Done post-warmstart
+        # so it reflects the loaded rows. FROZEN (requires_grad=False): when the
+        # weight was learnable, training drove it to ~0 to shrink the image away and
+        # answer from the language prior (std_vs_ref 24->0.019, attempt 1). Freezing
+        # removes that escape — the model cannot turn the image off via the scale.
         if self.projector.out_norm is not None:
             text_std = self.backbone.model.get_input_embeddings().weight.detach().std()
             self.projector.out_norm.weight.data.fill_(text_std.item())
+            self.projector.out_norm.weight.requires_grad_(False)
 
         if self.config.training.ema > 0:
             self.ema = models.ema.ExponentialMovingAverage(
