@@ -40,8 +40,18 @@ EXPECTED = {
 
 # Hyperparameters that MUST be identical across every config (only the attention
 # layout is allowed to vary). Values read raw (unresolved) to avoid needing the
-# runtime custom resolvers.
-CONTROLLED = ['backbone', 'parameterization', 'mode']
+# runtime custom resolvers. Dot-paths are resolved by _get. Any drift here makes
+# a run an INVALID ablation point — a confound that wastes the whole GPU run
+# without crashing — so the guard covers optimisation, schedule, precision, and
+# the architecture skeleton, not just the headline three.
+CONTROLLED = [
+    'backbone', 'parameterization', 'mode',
+    'trainer.max_steps', 'trainer.gradient_clip_val',
+    'trainer.precision', 'trainer.val_check_interval',
+    'loader.global_batch_size', 'loader.batch_size',
+    'optim.lr', 'optim.weight_decay',
+    'model.hidden_size', 'model.n_blocks', 'model.n_heads',
+]
 
 
 def _get(d, path):
@@ -80,9 +90,6 @@ def main():
             rows.append((exp, idx, len(idx), max_steps, lr, gbs, wname, match))
 
             controls[exp] = {k: _get(raw, k) for k in CONTROLLED}
-            controls[exp]['max_steps'] = max_steps
-            controls[exp]['lr'] = lr
-            controls[exp]['global_batch_size'] = gbs
 
     print(f'{"experiment":<14}{"attn_layers":<18}{"#":<3}'
           f'{"max_steps":<11}{"lr":<8}{"gbs":<5}{"wandb":<12}status')
