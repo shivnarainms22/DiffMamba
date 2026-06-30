@@ -381,6 +381,67 @@ image-reliance objectives, larger scale) is the real open problem and is left as
 `unified_dataloader.py` (`understand_task`), `main_vlm.py` (`_uni_train` warm-start, `_uni_vqa_eval`,
 `_uni_vqa_diag`), `configs/experiment/uni_vqa_sft.yaml`.
 
+### 11.4 Grounding retrain — blindness localized to a conditioning bottleneck, then proven data/scale-bound (honest negative)
+
+§11.3 left an open question: *why* is the unified model blind, and can an objective fix it? We answered
+both — the first with a read-only diagnostic, the second with two targeted retrains. The result is a
+clean negative: at 130M the blindness is **data/scale-bound, not objective-bound**.
+
+**Diagnostic (`mode=uni_grounding_diag`, read-only on the frozen `uni_vqa_sft` ckpt).** Four probes
+localize where grounding fails: **A** connector variation (do distinct images map to distinct prefixes?),
+**B** logit sensitivity (does swapping the image move the answer distribution?), **C** gradient saliency
+(does the answer carry gradient back to the image prefix?), **D** a scale-match precheck. The result:
+the image is ignored at the **output** (B `sym_kl ≈ 0`) while the connector is alive but **scale-pathological**
+— the projected prefix runs **~24× the text-embedding scale**, and the answer-loss sends only **~0.9%** of
+the text gradient to the image (C `grad_ratio = 0.009`). Probe D showed that rescaling the prefix to the
+text scale lifts that ratio **0.009 → 0.55 (~59×)**. **Root cause** (verified in `models/dimamba.py:415-416`):
+the backbone's first block is RMSNorm pre-norm = *scale-invariant*, so the 24× scale does not suppress the
+image at the output — it throttles the projector's *training gradient* ~24× (RMSNorm grad ∝ 1/‖input‖). The
+projector therefore receives almost no learning signal, and the backbone learns to answer from the prior.
+
+**Two-lever fix, both opt-in flags (default off → existing behavior unchanged):** (1) **scale-match** the
+projector with an `nn.RMSNorm` on its output, initialized to the text-embed std (un-throttles the gradient
+Probe D quantified); (2) an **in-batch image-contrastive loss** (`grounding_train_utils.image_contrastive_loss`)
+that makes a blind answer loss-*increasing* — the gold answer must be more likely under the image's *own*
+prefix than under in-batch negatives. Both wired behind `vlm.proj_scale_match` / `vlm.contrastive_weight`,
+warm-started from `uni_vqa_sft`, 8000 steps @ 2e-4. Held-out VQAv2 eval, n=200:
+
+| | uni_vqa_sft | Attempt 1 (learnable scale) | Attempt 2 (frozen scale + dominant contrastive) |
+|---|---|---|---|
+| exact, correct image | 0.265 | 0.255 | 0.260 |
+| exact, shuffled image | 0.285 | 0.260 | 0.255 |
+| **image delta** | **−0.020** | **−0.005** | **+0.005** |
+| Probe B `sym_kl` (img A vs B) | ≈0 | ≈0 | ≈0 (1.4e-6) |
+| Probe C grad ratio | 0.009 | 0.109 | **0.356** |
+| Probe A `std_vs_ref` | 24.4 | 0.019 | 0.019 |
+
+**The objective worked exactly as designed — and the model routed around it twice.** Scale-match did
+un-throttle the projector gradient (C: 0.009 → 0.109 → 0.356, ~38× by attempt 2). But the image delta
+never moved off zero:
+- **Attempt 1** used a *learnable* scale-match weight. Training drove it ~0 to **shrink the image prefix
+  away** (`std_vs_ref` 24.4 → 0.019) and kept answering from the prior — contrastive (weight 0.5) was
+  outgunned 4:1 by the understanding loss.
+- **Attempt 2** *froze* the scale at text-std (closing the shrink escape; Probe D confirms the freeze held —
+  rescaling the prefix *up* now *lowers* grad ratio 0.356 → 0.043, only possible if magnitude is already at
+  text-scale) and made contrastive dominant (weight 2.0 vs 1.0, num_neg 2). With the magnitude escape closed,
+  the projector found a **new** one: it collapsed to a **near-constant prefix across images** (Probe A cosine
+  **0.954**, cross-image variation only **2%** of text scale), so the output is image-independent regardless
+  of scale or gradient (B `sym_kl ≈ 1.4e-6`). The model answered `"no"` to **184 of 200** questions.
+  Generation was preserved (0.187 ≈ the 0.194 prior — no catastrophic forgetting).
+
+**Conclusion (stopping rule).** Two distinct objective escapes — magnitude-shrink, then constant-collapse —
+both lead to the same blind prior, even with the projector gradient un-throttled ~38× and a dominant
+contrastive term. The bottleneck is therefore **not the objective**: it is the **data grain and scale**.
+VQAv2 is ~26% blind-answerable, the model is 130M, and a comparable diffusion VLM (LLaDA-V) only grounds at
+~8B parameters and ~12M samples (~60× larger, ~1000× more data). No objective patch closes that gap, so we
+stop patching it. This is a *well-characterized* negative — blindness localized to a conditioning bottleneck,
+the bottleneck's mechanism verified in code, and two objective fixes shown to be necessary-but-insufficient —
+which together scope the real open problem (image-necessary data such as GQA, balanced complementary pairs,
+and larger scale) rather than leaving it as a vague "future work." Code: `grounding_diag_utils.py`,
+`grounding_train_utils.py`, `models/vision.py` (`MLPProjector(scale_match=…)`), `unified_diffusion.py`
+(`_understand_contrastive`, frozen scale-match init), `main_vlm.py` (`mode=uni_grounding_diag`),
+`configs/experiment/uni_grounding.yaml`.
+
 ## Reproduce
 
 ```bash
@@ -427,6 +488,13 @@ python main_vlm.py +experiment=uni_stage3 mode=uni_vqa_eval \
   eval.checkpoint_path=/scratch/.../runs/uni_stage3/checkpoints/best.ckpt sampling.steps=64
 python main_vlm.py +experiment=uni_stage3 mode=uni_vqa_diag \
   eval.checkpoint_path=/scratch/.../runs/uni_stage3/checkpoints/best.ckpt sampling.steps=64
+
+# §11.4 Grounding retrain (scale-match + image-contrastive) — frozen-scale attempt 2
+bash scripts/submit_vlm.sh uni_grounding_v2 uni_grounding 8000
+# Gate (all three; CKPT=runs/uni_grounding_v2/checkpoints/last.ckpt) — or: sbatch scripts/gate_eval.sh
+python main_vlm.py +experiment=uni_grounding mode=uni_vqa_eval      eval.checkpoint_path=$CKPT sampling.steps=64  # delta stays ~0 (blind)
+python main_vlm.py +experiment=uni_grounding mode=uni_grounding_diag eval.checkpoint_path=$CKPT sampling.steps=64  # B sym_kl~0, A cosine 0.95
+python main_vlm.py +experiment=uni_grounding mode=uni_eval          eval.checkpoint_path=$CKPT sampling.steps=64  # generation preserved
 ```
 
 Stage 1 code: `models/vision.py`, `models/mm_dimamba.py`, `mm_diffusion.py`,
