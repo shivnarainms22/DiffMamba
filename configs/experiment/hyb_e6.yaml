@@ -1,0 +1,42 @@
+# @package _global_
+#
+# Ablation Arm A (count): attention every 6th block -> layers [5,11] = 2
+# attention layers. Identical to hybrid_130m except the attention schedule, so
+# PPL isolates the attention COUNT (headline question: how few attn layers
+# still match the Transformer / the 3-layer baseline?).
+
+defaults:
+  - override /model: small-hybrid-dimamba
+  - override /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor, sigterm_save]
+
+backbone: hybrid_dimamba
+parameterization: subs
+mode: train
+
+model:
+  hybrid_attention_every: 6
+  hybrid_attention_offset: 5
+
+trainer:
+  max_steps: 76_000
+  val_check_interval: 5000
+  gradient_clip_val: 1.0
+  precision: 'bf16-mixed'
+
+loader:
+  global_batch_size: 64
+  batch_size: 8
+
+optim:
+  lr: 3e-4
+  weight_decay: 0.01
+
+wandb:
+  name: hyb_e6
+
+callbacks:
+  hf_hub_uploader:
+    _target_: hf_hub_callback.HFHubUploadCallback
+    repo_id: ${oc.env:HF_HUB_REPO_ID,null}
+    every_n_train_steps: 5000
+    path_in_repo: hyb_e6_seed${seed}

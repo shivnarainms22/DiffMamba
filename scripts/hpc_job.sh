@@ -75,9 +75,13 @@ python -c "import mamba_ssm" 2>/dev/null || {
     echo "  mamba_ssm built."
 }
 
-# flash-attn: only the Transformer backbone (runB) calls it at runtime.
-# Gate on experiment name so BiMamba runs don't waste ~20 min building it.
-if [[ "${EXPERIMENT}" == *transformer* ]]; then
+# flash-attn: the Transformer backbone (runB) AND the hybrid backbone's
+# attention blocks (DDiTBlock.forward -> flash_attn_varlen_qkvpacked_func) call
+# it at runtime. Gate on experiment name so pure-BiMamba runs don't waste ~20
+# min building it. The import check short-circuits when it is already present,
+# so covering hybrid runs is free when the env already has the wheel and saves
+# a guaranteed crash-at-first-attention-layer when it does not.
+if [[ "${EXPERIMENT}" == *transformer* || "${EXPERIMENT}" == *hyb* ]]; then
     python -c "import flash_attn" 2>/dev/null || {
         echo "flash_attn not importable — compiling from source (~15-20 min)..."
         MAX_JOBS=4 pip install "flash-attn>=2.5.0" --force-reinstall --no-deps --no-build-isolation --no-cache-dir --no-binary :all: -q
