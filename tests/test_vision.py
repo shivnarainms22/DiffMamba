@@ -18,6 +18,31 @@ def test_projector_handles_dim_change():
   assert y.shape == (1, 729, 768)
 
 
+def test_scale_match_output_rms_is_stable_across_input_scale():
+  """RMSNorm on the projector output -> output RMS ~= norm weight, regardless of
+  how hot the input is. This is what un-throttles the projector gradient."""
+  proj = MLPProjector(in_dim=8, out_dim=16, hidden_dim=32, scale_match=True)
+  proj.out_norm.weight.data.fill_(1.0)
+  for scale in (0.1, 1.0, 24.0):
+    y = proj(torch.randn(64, 8) * scale)
+    assert 0.8 < y.pow(2).mean().sqrt().item() < 1.25  # ~1.0 independent of input
+
+
+def test_scale_match_rms_tracks_norm_weight():
+  proj = MLPProjector(8, 16, 32, scale_match=True)
+  proj.out_norm.weight.data.fill_(0.17)
+  y = proj(torch.randn(64, 8))
+  assert 0.10 < y.pow(2).mean().sqrt().item() < 0.25
+
+
+def test_without_scale_match_output_rms_grows_with_input():
+  proj = MLPProjector(8, 16, 32, scale_match=False)
+  assert proj.out_norm is None
+  small = proj(torch.randn(64, 8) * 0.1).pow(2).mean().sqrt().item()
+  big = proj(torch.randn(64, 8) * 24.0).pow(2).mean().sqrt().item()
+  assert big > 3 * small
+
+
 import pytest
 
 

@@ -18,6 +18,8 @@ vlm:
   boi_id: 50258
   eoi_id: 50259
   image_base: 50260
+  # Used by the generation stream for CFG-capable unified checkpoints.
+  caption_dropout_prob: 0.0
 
   # shared text
   caption_prompt: "Describe the image."
@@ -29,6 +31,11 @@ vlm:
   generate_weight: 1.0
   text_weight: 0.0
 
+  # grounding retrain (off by default; uni_grounding.yaml turns them on)
+  proj_scale_match: false   # RMSNorm the projector output to the text-embed scale
+  contrastive_weight: 0.0   # weight of the in-batch image-contrastive loss
+  num_neg: 1                # negatives per example for the contrastive loss
+
   # CC3M, used BOTH directions (match max_examples to gen_stage2 to reuse its VQ cache)
   dataset: pixparse/cc3m-wds
   split: train
@@ -36,6 +43,16 @@ vlm:
   caption_column: txt
   streaming: true
   max_examples: 80000
+
+  # Optional VQA eval view for `mode=uni_vqa_eval`; kept separate from the
+  # CC3M training stream so unified training remains unchanged.
+  vqa_dataset: lmms-lab/VQAv2
+  vqa_split: validation
+  vqa_image_column: image
+  vqa_caption_column: multiple_choice_answer
+  vqa_question_column: question
+  vqa_max_examples: 40000
+  vqa_text_len: 64
 
   # warm-start the text rows from the DiffMamba text backbone
   warmstart_path: /scratch/sarin.s/DiffMamba/runs/runD_lr1e3/checkpoints/best.ckpt

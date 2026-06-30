@@ -10,12 +10,14 @@ separate so the text-only DiffMamba entry (main.py) stays untouched.
 """
 import itertools
 import os
+import copy
 
 import fsspec
 import hydra
 import lightning as L
 import omegaconf
 import torch
+from omegaconf import open_dict
 
 # Same self-produced-checkpoint torch.load shim as main.py (Lightning passes
 # weights_only=True explicitly on resume; our ckpts store OmegaConf objects).
@@ -38,6 +40,9 @@ import utils
 from gen_diffusion import GenDiffusion
 from mm_diffusion import MMDiffusion
 from unified_diffusion import UnifiedDiffusion
+from vlm_eval_utils import score_vqa_answer, summarize_vqa_rows
+from grounding_diag_utils import (
+    grad_norm_ratio, image_prefix_variation, logit_distribution_shift)
 
 omegaconf.OmegaConf.register_new_resolver('cwd', os.getcwd)
 omegaconf.OmegaConf.register_new_resolver(
@@ -159,6 +164,7 @@ def _vlm_eval(config, logger, tokenizer):
         rows.append({'question': q, 'gold': gold, 'generated': gen,
                      'exact': is_exact, 'recall': is_recall})
 
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
     out_path = os.path.join(config.checkpointing.save_dir, 'vlm_eval.json')
     summary = {'n': n_eval, 'exact_match': exact / n_eval,
                'gold_recall': recall / n_eval, 'sampling_steps': steps}
@@ -288,6 +294,7 @@ def _gen_eval(config, logger, tokenizer):
     summary = {'n': n, 'clip_matched': matched,
                'clip_mismatched_shuffled': mismatched,
                'sampling_steps': config.sampling.steps}
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
     out = os.path.join(config.checkpointing.save_dir, 'gen_eval.json')
     json.dump(summary, open(out, 'w'), indent=2)
     print(f'Gen CLIP-score (n={n}): matched={matched:.3f} vs '
@@ -307,7 +314,26 @@ def _uni_train(config, logger, tokenizer):
         ckpt_path = None
 
     train_ds, valid_ds = unified_dataloader.get_unified_dataloaders(config, tokenizer)
-    model = UnifiedDiffusion(config, tokenizer=tokenizer)
+    warmstart = config.vlm.get('unified_warmstart_path', '')
+    if warmstart and ckpt_path is None:
+        # SFT: load full unified weights (backbone+projector+noise+EMA) from a prior
+        # unified checkpoint; fresh optimizer/step (trainer.fit ckpt_path stays None).
+        # NOTE: the warm-start config (uni_vqa_sft.yaml) empties vlm.warmstart_path and
+        # vlm.projector_warmstart_path so __init__'s PARTIAL warm-starts are skipped —
+        # this full checkpoint load supplies all weights. Keep them empty alongside
+        # unified_warmstart_path, else the partial loads fire and are clobbered here.
+        # Controlled non-strict load: the grounding retrain adds projector.out_norm
+        # (scale-match), which predates the warm-start ckpt and is intentionally
+        # initialized in __init__. Allow ONLY that key to be missing — any other
+        # missing/unexpected key is a real arch mismatch and must fail loudly.
+        model = UnifiedDiffusion(config, tokenizer=tokenizer)
+        sd = torch.load(warmstart, map_location='cpu', weights_only=False)['state_dict']
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        allowed = {k for k in missing if k.startswith('projector.out_norm')}
+        assert set(missing) == allowed, f'unexpected MISSING keys: {set(missing) - allowed}'
+        assert not unexpected, f'unexpected EXTRA keys: {unexpected}'
+    else:
+        model = UnifiedDiffusion(config, tokenizer=tokenizer)
 
     trainer = hydra.utils.instantiate(
         config.trainer,
@@ -397,6 +423,7 @@ def _uni_eval(config, logger, tokenizer):
     summary = {'n': n,
                'understand_matched': u_matched, 'understand_shuffled': u_shuffled,
                'generate_matched': g_matched, 'generate_shuffled': g_shuffled}
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
     out_path = os.path.join(config.checkpointing.save_dir, 'uni_eval.json')
     json.dump(summary, open(out_path, 'w'), indent=2)
     print(f'UNIFIED eval (n={n}):')
@@ -405,6 +432,439 @@ def _uni_eval(config, logger, tokenizer):
     print(f'  generate   (gen image vs caption, CLIP):     '
           f'matched={g_matched:.3f} vs shuffled={g_shuffled:.3f}')
     print('  matched>shuffled in BOTH => one model understands AND generates')
+    print(f'  written {out_path}')
+
+
+def _load_unified_eval_model(config, tokenizer):
+    model = UnifiedDiffusion.load_from_checkpoint(
+        config.eval.checkpoint_path, tokenizer=tokenizer, config=config).to('cuda')
+    if config.eval.disable_ema:
+        model.ema = None
+    elif model.ema is not None:
+        model.ema.move_shadow_params_to_device(model.device)
+        model.ema.copy_to(itertools.chain(model.backbone.parameters(),
+                                          model.projector.parameters(),
+                                          model.noise.parameters()))
+    model.eval()
+    return model
+
+
+def _unified_vqa_view(config):
+    cfg = copy.deepcopy(config)
+    v = config.vlm
+    with open_dict(cfg):
+        cfg.vlm.num_image_tokens = v.siglip_tokens
+        cfg.vlm.text_len = v.get('vqa_text_len', v.caption_len)
+        cfg.vlm.dataset = v.get('vqa_dataset', 'lmms-lab/VQAv2')
+        cfg.vlm.split = v.get('vqa_split', 'validation')
+        cfg.vlm.image_column = v.get('vqa_image_column', 'image')
+        cfg.vlm.caption_column = v.get(
+            'vqa_caption_column', 'multiple_choice_answer')
+        cfg.vlm.question_column = v.get('vqa_question_column', 'question')
+        cfg.vlm.label_as_caption = False
+        cfg.vlm.streaming = True
+        cfg.vlm.max_examples = v.get('vqa_max_examples', 40000)
+    return cfg
+
+
+def _decode_answer(tokenizer, ids):
+    ids = list(ids)
+    if tokenizer.eos_token_id in ids:
+        ids = ids[:ids.index(tokenizer.eos_token_id)]
+    if tokenizer.pad_token_id is not None:
+        ids = [i for i in ids if i != tokenizer.pad_token_id]
+    return tokenizer.decode(ids).strip()
+
+
+def _uni_vqa_eval(config, logger, tokenizer):
+    """Unified-model VQA eval with shuffled-image ablation.
+
+    This measures the understanding behavior Stage 3 previously could not
+    resolve with free-form caption CLIP: exact/recalled short answers against
+    VQAv2-style gold labels, plus the same prompts paired with shuffled image
+    features to estimate how much accuracy is genuinely image-conditioned.
+    """
+    import json
+
+    model = _load_unified_eval_model(config, tokenizer)
+    _, valid_ds = mm_dataloader.get_mm_dataloaders(
+        _unified_vqa_view(config), tokenizer)
+    ds = valid_ds.dataset
+    n_eval = min(len(ds), int(config.eval.get('num_eval', 200)))
+    steps = config.sampling.steps
+
+    rows = []
+    with torch.no_grad():
+        for i in range(n_eval):
+            rec = ds.text_records[i]
+            q, gold = rec['prompt'], rec['answer']
+            prompt = [tokenizer.bos_token_id] + tokenizer.encode(
+                q, add_special_tokens=False)
+            prompt_ids = torch.tensor(prompt, device='cuda')[None]
+
+            feats = ds[i]['image_features'][None].to('cuda')
+            # Ablation image must be a DIFFERENT image. VQAv2 stores several
+            # questions per image consecutively, so the adjacent example (i+1)
+            # often shares i's image -> a no-op "shuffle". Offset by ~half the
+            # eval set to guarantee a different image_id.
+            shuf_idx = (i + max(1, n_eval // 2)) % n_eval
+            shuffled_feats = ds[shuf_idx]['image_features'][None].to('cuda')
+
+            out = model._sample_caption(
+                feats, prompt_ids, num_steps=steps)
+            shuffled = model._sample_caption(
+                shuffled_feats, prompt_ids, num_steps=steps)
+
+            gen = _decode_answer(tokenizer, out[0].tolist())
+            gen_shuf = _decode_answer(tokenizer, shuffled[0].tolist())
+            exact, recall = score_vqa_answer(gen, gold)
+            shuf_exact, shuf_recall = score_vqa_answer(gen_shuf, gold)
+
+            rows.append({
+                'question': q,
+                'gold': gold,
+                'generated_correct': gen,
+                'generated_shuffled': gen_shuf,
+                'correct_exact': exact,
+                'correct_recall': recall,
+                'shuffled_exact': shuf_exact,
+                'shuffled_recall': shuf_recall,
+            })
+
+    summary = summarize_vqa_rows(rows, sampling_steps=steps)
+    summary['checkpoint'] = config.eval.checkpoint_path
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
+    out_path = os.path.join(config.checkpointing.save_dir, 'uni_vqa_eval.json')
+    json.dump({'summary': summary, 'rows': rows}, open(out_path, 'w'), indent=2)
+
+    print(f'UNIFIED VQA eval ({n_eval} held-out VQAv2-style examples):')
+    print(f'  correct image:  exact={summary["correct_exact_match"]:.3f}  '
+          f'recall={summary["correct_gold_recall"]:.3f}')
+    print(f'  shuffled image: exact={summary["shuffled_exact_match"]:.3f}  '
+          f'recall={summary["shuffled_gold_recall"]:.3f}')
+    print(f'  image delta:    exact={summary["image_ablation_exact_delta"]:.3f}  '
+          f'recall={summary["image_ablation_recall_delta"]:.3f}')
+    print(f'  written {out_path}')
+
+
+def _uni_vqa_diag(config, logger, tokenizer):
+    """Diagnostic for the all-empty uni_vqa_eval generations.
+
+    For the first few VQAv2-style examples, generate an answer region with BOTH
+    the actual question prompt AND the in-distribution caption prompt
+    ("Describe the image."), printing the raw token ids and the decoded string.
+
+    Reads the result like this:
+      - caption decoded is non-empty (real words) but the question answer is
+        empty/EOS-first  -> the image+feature pipeline is fine; the unified
+        captioner simply has no question-answering ability (OOD prompt).
+      - caption answer is ALSO empty -> the VQAv2 feature pipeline is broken,
+        not the prompt; chase the features.
+    """
+    model = _load_unified_eval_model(config, tokenizer)
+    _, valid_ds = mm_dataloader.get_mm_dataloaders(
+        _unified_vqa_view(config), tokenizer)
+    ds = valid_ds.dataset
+    steps = config.sampling.steps
+    cap_prompt = config.vlm.caption_prompt
+    n = min(len(ds), int(config.eval.get('num_diag', 8)))
+
+    def _gen(feats, text):
+        p = [tokenizer.bos_token_id] + tokenizer.encode(
+            text, add_special_tokens=False)
+        pids = torch.tensor(p, device='cuda')[None]
+        return model._sample_caption(feats, pids, num_steps=steps)[0].tolist()
+
+    print(f'EOS id={tokenizer.eos_token_id}  PAD id={tokenizer.pad_token_id}  '
+          f'caption_prompt={cap_prompt!r}  steps={steps}')
+    with torch.no_grad():
+        for i in range(n):
+            rec = ds.text_records[i]
+            q, gold = rec['prompt'], rec['answer']
+            feats = ds[i]['image_features'][None].to('cuda')
+            qout = _gen(feats, q)
+            cout = _gen(feats, cap_prompt)
+            print(f'[{i}] Q={q!r} gold={gold!r}')
+            print(f'    question -> ids[:12]={qout[:12]}  '
+                  f'decoded={_decode_answer(tokenizer, qout)!r}')
+            print(f'    caption  -> ids[:12]={cout[:12]}  '
+                  f'decoded={_decode_answer(tokenizer, cout)!r}')
+
+
+def _uni_grounding_diag(config, logger, tokenizer):
+    """Localize WHERE image grounding fails, read-only on the frozen ckpt.
+
+    The behavioral shuffle (uni_vqa_eval) proved the model answers VQA blind but
+    not *why*. Three probes triangulate the failure (see
+    docs/superpowers/specs/2026-06-10-grounding-diagnostic-scope.md):
+
+      A connector collapse -> does the projector map distinct images to distinct
+        prefixes, or to ~one vector? (cosine ~1 / std ~0 == dead)
+      B logit sensitivity  -> swapping the image (A vs B vs zeroed), sampler-free,
+        does the answer-region distribution actually move?
+      C gradient saliency  -> does the answer log-prob carry gradient back to the
+        image prefix at all, vs the text? (ratio ~0 == attention-dead prefix)
+
+    Every probe runs on uni_stage3/best.ckpt with no training. The result picks
+    which retrain is justified, so we don't spend GPU guessing.
+    """
+    import json
+
+    from models.mm_ops import assemble_mm_embeds, slice_text_logits
+
+    model = _load_unified_eval_model(config, tokenizer)
+    _, valid_ds = mm_dataloader.get_mm_dataloaders(
+        _unified_vqa_view(config), tokenizer)
+    ds = valid_ds.dataset
+    steps = config.sampling.steps
+    siglip = config.vlm.siglip_tokens
+    n_probe = min(len(ds), int(config.eval.get('num_probe', 16)))
+    pdtype = next(model.projector.parameters()).dtype
+
+    def _masked_state(prompt_ids):
+        """Initial caption state: prompt fixed, answer region all MASK (mirrors
+        _sample_caption)."""
+        b, p = prompt_ids.shape
+        length = config.vlm.caption_len + 8
+        x = torch.full((b, p + length), model.mask_index,
+                       dtype=torch.long, device='cuda')
+        x[:, :p] = prompt_ids
+        return x, p
+
+    def _sigma_at(t_val, b=1):
+        st = model.noise(t_val * torch.ones(b, 1, device='cuda'))[0]
+        return st.squeeze(-1) if st.ndim > 1 else st
+
+    # ---- Probe A: connector collapse across DISTINCT images ----
+    # VQAv2 groups questions per image; stride the indices to hit different images.
+    k = min(n_probe, len(ds))
+    stride = max(1, len(ds) // k)
+    a_idxs = [(j * stride) % len(ds) for j in range(k)]
+    with torch.no_grad():
+        feats_k = torch.stack([ds[i]['image_features'] for i in a_idxs]).to('cuda')
+        proj = model.projector(feats_k.to(pdtype))  # (K, N, D)
+    ref_scale = model.backbone.model.get_input_embeddings().weight.float().std().item()
+    probe_a = image_prefix_variation(proj, ref_scale=ref_scale)
+
+    # ---- Probe B: distribution sensitivity to the image, across timesteps ----
+    # `_forward_understand` returns SUBS log-probs, so only sym_kl is meaningful
+    # (a raw L2 is dominated by the large-negative mask-token fill and cancels in
+    # the distribution -> dropped). Sweep several noise levels so a single
+    # max-noise timestep can't hide image dependence that only shows at refinement.
+    n_b = min(8, n_probe)
+    t_grid = [0.8, 0.5, 0.2]
+    per_t = {t: {'ab': [], 'a0': []} for t in t_grid}
+    with torch.no_grad():
+        for i in range(n_b):
+            rec = ds.text_records[i]
+            prompt = [tokenizer.bos_token_id] + tokenizer.encode(
+                rec['prompt'], add_special_tokens=False)
+            prompt_ids = torch.tensor(prompt, device='cuda')[None]
+            x, p = _masked_state(prompt_ids)
+
+            featsA = ds[i]['image_features'][None].to('cuda')
+            shuf = (i + max(1, n_b // 2)) % n_b
+            featsB = ds[shuf]['image_features'][None].to('cuda')
+            zeros = torch.zeros_like(featsA)
+
+            for tv in t_grid:
+                st = _sigma_at(tv)
+                lpA = model._forward_understand(x, st[:, None], featsA)[:, p:, :]
+                lpB = model._forward_understand(x, st[:, None], featsB)[:, p:, :]
+                lp0 = model._forward_understand(x, st[:, None], zeros)[:, p:, :]
+                per_t[tv]['ab'].append(
+                    logit_distribution_shift(lpA[0], lpB[0])['sym_kl'])
+                per_t[tv]['a0'].append(
+                    logit_distribution_shift(lpA[0], lp0[0])['sym_kl'])
+
+    def _avg(rows, key):
+        return sum(r[key] for r in rows) / max(1, len(rows))
+
+    def _mean(xs):
+        return sum(xs) / max(1, len(xs))
+
+    by_t = {f't={t}': {'ab_sym_kl': _mean(per_t[t]['ab']),
+                       'a0_sym_kl': _mean(per_t[t]['a0'])} for t in t_grid}
+    probe_b = {
+        'n': n_b,
+        'by_timestep': by_t,
+        # If the image matters at ANY noise level, the max is > 0.
+        'max_ab_sym_kl': max(_mean(per_t[t]['ab']) for t in t_grid),
+        'max_a0_sym_kl': max(_mean(per_t[t]['a0']) for t in t_grid),
+    }
+
+    # ---- Probe C: gradient saliency, image prefix vs text ----
+    # Reconstruct _forward_understand (unified_diffusion.py:99-110) with the image
+    # and text embeds as leaves, then backprop the GOLD-answer cross-entropy.
+    # CE grad = (softmax - onehot) is non-saturating (unlike max-log-softmax, which
+    # is ~0 when the model is confident and zeroes BOTH grads), so this faithfully
+    # measures how much the training objective depends on the image vs the text.
+    n_c = min(4, n_probe)
+    ratios = []
+    for i in range(n_c):
+        rec = ds.text_records[i]
+        gold_ids = tokenizer.encode(rec['answer'], add_special_tokens=False)
+        if not gold_ids:
+            continue
+        prompt = [tokenizer.bos_token_id] + tokenizer.encode(
+            rec['prompt'], add_special_tokens=False)
+        prompt_ids = torch.tensor(prompt, device='cuda')[None]
+        x, p = _masked_state(prompt_ids)
+        st = _sigma_at(0.5)  # mid-noise: answer region partly informative
+        feats = ds[i]['image_features'][None].to('cuda')
+
+        with torch.cuda.amp.autocast(dtype=torch.float32):
+            sigma = model._process_sigma(st[:, None])
+            c = None
+            if model.backbone.temb_strategy is not None:
+                c = torch.nn.functional.silu(model.backbone.sigma_map(sigma))
+            text_embeds = model.backbone.model.get_input_embeddings()(
+                x).detach().requires_grad_(True)
+            img = model.projector(feats.to(pdtype)).to(
+                text_embeds.dtype).detach().requires_grad_(True)
+            fused = assemble_mm_embeds(img, text_embeds)
+            logits = model.backbone.model(
+                inputs_embeds=fused, time_embeds=c).logits
+            logits = slice_text_logits(logits, siglip)
+            ans = logits[:, p:, :]
+            tgt_len = min(len(gold_ids), ans.shape[1])
+            tgt = torch.tensor(gold_ids[:tgt_len], device='cuda')
+            scalar = torch.nn.functional.cross_entropy(ans[0, :tgt_len, :], tgt)
+        model.zero_grad(set_to_none=True)
+        scalar.backward()
+        ratios.append(grad_norm_ratio(img.grad, text_embeds.grad))
+
+    probe_c = {
+        'n': len(ratios),
+        'image_grad_norm': _avg(ratios, 'image_grad_norm'),
+        'text_grad_norm': _avg(ratios, 'text_grad_norm'),
+        'image_to_text_ratio': _avg(ratios, 'image_to_text_ratio'),
+    }
+
+    # ---- Probe D: scale-match pre-check ----
+    # Probe A showed the projected prefix runs ~24x the text-embed scale. Re-feed
+    # the SAME frozen projector output rescaled to the text-embed std and re-measure
+    # output sensitivity (B-style sym_kl, swap-confound-free) and gold-CE gradient
+    # (C-style). If matched-scale lifts these from ~0, the scale mismatch is a
+    # dominant bottleneck and the retrain must scale-match the projector; if not,
+    # the gradient starvation is objective/data-driven (prioritize contrastive /
+    # up-weighting instead).
+    text_std = model.backbone.model.get_input_embeddings().weight.float().std()
+
+    def _recon(x, p, feats, match, want_grad):
+        ctx = torch.enable_grad() if want_grad else torch.no_grad()
+        st = _sigma_at(0.5)
+        with ctx, torch.cuda.amp.autocast(dtype=torch.float32):
+            sigma = model._process_sigma(st[:, None])
+            c = None
+            if model.backbone.temb_strategy is not None:
+                c = torch.nn.functional.silu(model.backbone.sigma_map(sigma))
+            text_embeds = model.backbone.model.get_input_embeddings()(x)
+            img = model.projector(feats.to(pdtype)).to(text_embeds.dtype)
+            if match:  # rescale THIS image's prefix to the text-embed std
+                s = text_std / (img.float().std() + 1e-8)
+                img = img * s.to(img.dtype)
+            if want_grad:  # leaf = the tensor as fed, so grad has no scale confound
+                img = img.detach().requires_grad_(True)
+                text_embeds = text_embeds.detach().requires_grad_(True)
+            fused = assemble_mm_embeds(img, text_embeds)
+            logits = slice_text_logits(model.backbone.model(
+                inputs_embeds=fused, time_embeds=c).logits, siglip)
+        return logits, img, text_embeds
+
+    def _scalecheck(match):
+        n_d = min(4, n_probe)
+        kl_ab, kl_a0, gr = [], [], []
+        for i in range(n_d):
+            rec = ds.text_records[i]
+            gold_ids = tokenizer.encode(rec['answer'], add_special_tokens=False)
+            prompt = [tokenizer.bos_token_id] + tokenizer.encode(
+                rec['prompt'], add_special_tokens=False)
+            prompt_ids = torch.tensor(prompt, device='cuda')[None]
+            x, p = _masked_state(prompt_ids)
+            featsA = ds[i]['image_features'][None].to('cuda')
+            shuf = (i + max(1, n_d // 2)) % n_d
+            featsB = ds[shuf]['image_features'][None].to('cuda')
+            zeros = torch.zeros_like(featsA)
+            lA = _recon(x, p, featsA, match, False)[0][:, p:, :]
+            lB = _recon(x, p, featsB, match, False)[0][:, p:, :]
+            l0 = _recon(x, p, zeros, match, False)[0][:, p:, :]
+            kl_ab.append(logit_distribution_shift(lA[0], lB[0])['sym_kl'])
+            kl_a0.append(logit_distribution_shift(lA[0], l0[0])['sym_kl'])
+            if gold_ids:
+                logits, img, txt = _recon(x, p, featsA, match, True)
+                ans = logits[:, p:, :]
+                tl = min(len(gold_ids), ans.shape[1])
+                tgt = torch.tensor(gold_ids[:tl], device='cuda')
+                ce = torch.nn.functional.cross_entropy(ans[0, :tl, :], tgt)
+                model.zero_grad(set_to_none=True)
+                ce.backward()
+                gr.append(grad_norm_ratio(img.grad, txt.grad)['image_to_text_ratio'])
+        return {'sym_kl_ab': _mean(kl_ab), 'sym_kl_a0': _mean(kl_a0),
+                'grad_ratio': _mean(gr)}
+
+    probe_d = {'raw': _scalecheck(False), 'scale_matched': _scalecheck(True)}
+    # Did scale-matching meaningfully wake the image up?
+    d_raw, d_m = probe_d['raw'], probe_d['scale_matched']
+    scale_helps = (
+        d_m['sym_kl_ab'] > max(10 * d_raw['sym_kl_ab'], 1e-3)
+        or d_m['grad_ratio'] > max(10 * d_raw['grad_ratio'], 0.05))
+    probe_d['scale_is_dominant_bottleneck'] = bool(scale_helps)
+
+    # ---- Verdict (heuristic; raw numbers are the ground truth) ----
+    img_invariant = probe_b['max_ab_sym_kl'] < 1e-3
+    grad_dead = probe_c['image_to_text_ratio'] < 0.05
+    if (probe_a['mean_pairwise_cosine'] > 0.98
+            and probe_a.get('std_vs_ref', 1.0) < 0.05):
+        verdict = ('CONNECTOR COLLAPSE (Probe A): projector maps distinct images '
+                   'to ~one vector -> re-align the projector.')
+    elif img_invariant and grad_dead:
+        verdict = ('BACKBONE IGNORES PREFIX (B+C): connector varies but the answer '
+                   'is image-invariant at every timestep AND the objective carries '
+                   '~no gradient to the image -> conditioning/objective fix '
+                   '(image-token loss weight / scale-match projector / longer SFT).')
+    elif not img_invariant:
+        verdict = ('SIGNAL EXISTS, DECODE WASHES OUT (B): the distribution moves with '
+                   'the image yet sampling was image-invariant -> sampler/loss fix, '
+                   'maybe no retrain.')
+    else:
+        verdict = ('INCONCLUSIVE: inspect raw numbers; thresholds are heuristic.')
+
+    summary = {
+        'checkpoint': config.eval.checkpoint_path,
+        'sampling_steps': steps,
+        'probe_a_connector_variation': probe_a,
+        'probe_b_logit_sensitivity': probe_b,
+        'probe_c_gradient_saliency': probe_c,
+        'probe_d_scale_match_precheck': probe_d,
+        'suggested_reading': verdict,
+    }
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
+    out_path = os.path.join(
+        config.checkpointing.save_dir, 'uni_grounding_diag.json')
+    json.dump(summary, open(out_path, 'w'), indent=2)
+
+    print('GROUNDING DIAGNOSTIC (read-only, frozen checkpoint):')
+    print(f'  [A] connector: pairwise_cosine={probe_a["mean_pairwise_cosine"]:.4f}  '
+          f'feature_std={probe_a["mean_feature_std"]:.4f}  '
+          f'std_vs_ref={probe_a.get("std_vs_ref", float("nan")):.4f}  '
+          f'(cosine~1 / std~0 => connector dead; std_vs_ref>>1 => scale mismatch)')
+    print(f'  [B] image sensitivity (sym_kl, max over t): '
+          f'A-vs-B={probe_b["max_ab_sym_kl"]:.4f}  A-vs-zero={probe_b["max_a0_sym_kl"]:.4f} '
+          f'(~0 => image ignored at output)')
+    for tname, vals in probe_b['by_timestep'].items():
+        print(f'        {tname}: ab={vals["ab_sym_kl"]:.4f}  a0={vals["a0_sym_kl"]:.4f}')
+    print(f'  [C] gold-CE grad ratio image/text={probe_c["image_to_text_ratio"]:.4f}  '
+          f'(img={probe_c["image_grad_norm"]:.4f} txt={probe_c["text_grad_norm"]:.4f}; '
+          f'~0 => objective carries no signal to the image)')
+    print(f'  [D] scale-match pre-check (does rescaling the prefix to text scale wake it up?)')
+    print(f'        raw     : sym_kl_ab={d_raw["sym_kl_ab"]:.4f}  '
+          f'sym_kl_a0={d_raw["sym_kl_a0"]:.4f}  grad_ratio={d_raw["grad_ratio"]:.4f}')
+    print(f'        matched : sym_kl_ab={d_m["sym_kl_ab"]:.4f}  '
+          f'sym_kl_a0={d_m["sym_kl_a0"]:.4f}  grad_ratio={d_m["grad_ratio"]:.4f}')
+    print(f'        => scale mismatch is a DOMINANT bottleneck: '
+          f'{probe_d["scale_is_dominant_bottleneck"]}')
+    print(f'  => {verdict}')
     print(f'  written {out_path}')
 
 
@@ -466,6 +926,7 @@ def _vlm_caption_eval(config, logger, tokenizer):
     summary = {'n': n, 'understand_matched': matched,
                'understand_shuffled': shuffled, 'sampling_steps': steps,
                'checkpoint': config.eval.checkpoint_path}
+    os.makedirs(config.checkpointing.save_dir, exist_ok=True)
     out_path = os.path.join(config.checkpointing.save_dir, 'vlm_caption_eval.json')
     json.dump(summary, open(out_path, 'w'), indent=2)
     print(f'STANDALONE caption baseline (n={n}): '
@@ -487,6 +948,15 @@ def main(config):
         return
     if config.mode == 'uni_eval':
         _uni_eval(config, logger, tokenizer)
+        return
+    if config.mode == 'uni_vqa_eval':
+        _uni_vqa_eval(config, logger, tokenizer)
+        return
+    if config.mode == 'uni_vqa_diag':
+        _uni_vqa_diag(config, logger, tokenizer)
+        return
+    if config.mode == 'uni_grounding_diag':
+        _uni_grounding_diag(config, logger, tokenizer)
         return
     if config.mode == 'vlm_caption_eval':
         _vlm_caption_eval(config, logger, tokenizer)

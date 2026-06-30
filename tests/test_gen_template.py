@@ -30,6 +30,18 @@ def test_gen_sequence_layout_and_loss_mask():
     assert all(l == 1 for l in loss[1 + 5 + 1:])
 
 
+def test_gen_sequence_can_drop_caption_for_cfg_training():
+    cap = [10, 11, 12]
+    img = list(range(50260, 50260 + 4))
+    out = build_gen_sequence(cap, img, bos=BOS, boi=BOI, eoi=EOI, pad=0,
+                             caption_len=5, num_image_tokens=4,
+                             drop_caption=True)
+    ids, attn, loss = out['input_ids'], out['attention_mask'], out['loss_mask']
+    assert ids == [BOS, 0, 0, 0, 0, 0, BOI] + img + [EOI]
+    assert attn == [1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]
+    assert loss == [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1]
+
+
 # ---------------------------------------------------------------------------
 # Task 4 — vocab-id math + embedding-resize tensor op
 # ---------------------------------------------------------------------------

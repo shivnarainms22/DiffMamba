@@ -1,0 +1,35 @@
+# @package _global_
+#
+# VQA SFT (Stage 3.5): fine-tune the unified Stage-3 model to answer questions.
+# Understanding stream → VQAv2; generation stream → CC3M (unchanged).
+# Fresh optimizer / step; warm-start ALL weights from the uni_stage3 checkpoint.
+#
+# Usage (GPU node): python main_vlm.py +experiment=uni_vqa_sft
+
+defaults:
+  - uni_stage3
+
+vlm:
+  understand_task: vqa
+  # Understanding stream trains on VQAv2 `validation` (inherited vqa_split) — that
+  # is the labeled pool lmms-lab/VQAv2 hosts (same as Stage-1 vlm_sft). The mm
+  # dataloader deterministically holds out a tail slice for validation, and
+  # mode=uni_vqa_eval scores that same held-out tail — so there is no train/eval
+  # leakage (SFT trains the head, eval scores the tail).
+  unified_warmstart_path: /scratch/sarin.s/DiffMamba/runs/uni_stage3/checkpoints/best.ckpt
+  # Skip partial warm-starts in UnifiedDiffusion.__init__ — the full
+  # unified_warmstart_path load above handles all weights.
+  warmstart_path: ''
+  projector_warmstart_path: ''
+
+checkpointing:
+  save_dir: /scratch/sarin.s/DiffMamba/runs/uni_vqa_sft
+
+trainer:
+  max_steps: 8000
+
+optim:
+  lr: 2e-4
+
+wandb:
+  name: uni_vqa_sft

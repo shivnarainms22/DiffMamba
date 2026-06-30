@@ -13,6 +13,7 @@ import itertools
 
 import torch
 
+from cfg_utils import cfg_combine_log_probs, make_unconditional_prompt
 import models
 import utils
 from diffusion import Diffusion, Loss, _sample_categorical
@@ -40,13 +41,16 @@ class UnifiedDiffusion(Diffusion):
         self.w_u = v.get('understand_weight', 1.0)
         self.w_g = v.get('generate_weight', 1.0)
         self.w_t = v.get('text_weight', 0.0)
+        self.w_c = v.get('contrastive_weight', 0.0)
+        self.num_neg = v.get('num_neg', 1)
 
         # One shared expanded-vocab backbone + one projector.
         self.backbone = DiMamba(
             config, vocab_size=self.vocab_size, pad_token_id=tokenizer.pad_token_id)
         self.projector = MLPProjector(
             in_dim=v.vision_dim, out_dim=config.model.hidden_size,
-            hidden_dim=v.projector_hidden)
+            hidden_dim=v.projector_hidden,
+            scale_match=v.get('proj_scale_match', False))
 
         ws = v.get('warmstart_path', '')
         if ws:
@@ -59,6 +63,17 @@ class UnifiedDiffusion(Diffusion):
         if pws:
             pinfo = load_projector_from_mm(self.projector, pws)
             assert pinfo['loaded'] > 0 and pinfo['unexpected'] == 0, pinfo
+
+        # Fix the scale-match norm at the text-embed scale (un-throttles the
+        # projector gradient; see grounding diagnostic Probe D). Done post-warmstart
+        # so it reflects the loaded rows. FROZEN (requires_grad=False): when the
+        # weight was learnable, training drove it to ~0 to shrink the image away and
+        # answer from the language prior (std_vs_ref 24->0.019, attempt 1). Freezing
+        # removes that escape — the model cannot turn the image off via the scale.
+        if self.projector.out_norm is not None:
+            text_std = self.backbone.model.get_input_embeddings().weight.detach().std()
+            self.projector.out_norm.weight.data.fill_(text_std.item())
+            self.projector.out_norm.weight.requires_grad_(False)
 
         if self.config.training.ema > 0:
             self.ema = models.ema.ExponentialMovingAverage(
@@ -113,6 +128,27 @@ class UnifiedDiffusion(Diffusion):
                                  lambda xt, s: self._forward_understand(xt, s, image_features))
         return self._weighted(per_tok, attention_mask, loss_mask)
 
+    def _understand_contrastive(self, x0, loss_mask, image_features, num_neg=1):
+        """In-batch contrastive: the gold answer must be more likely under its
+        OWN image than under rolled-in negatives. Same noised xt for every image
+        so only the image differs. Reuses _forward_understand."""
+        from grounding_train_utils import image_contrastive_loss
+        t = self._sample_t(x0.shape[0], x0.device)
+        sigma, _ = self.noise(t)
+        move_chance = 1 - torch.exp(-sigma[:, None])
+        xt = self.q_xt(x0, move_chance)
+        xt = torch.where(loss_mask.bool(), xt, x0)  # keep non-answer span clean
+
+        def answer_loglik(feats):
+            lp = self._forward_understand(xt, sigma[:, None], feats)  # (B,T,V) logp
+            tok = torch.gather(lp, -1, x0[:, :, None]).squeeze(-1)    # (B,T)
+            return (tok * loss_mask.to(tok.dtype)).sum(-1)            # (B,)
+
+        cols = [answer_loglik(image_features)]
+        for k in range(1, num_neg + 1):
+            cols.append(answer_loglik(torch.roll(image_features, shifts=k, dims=0)))
+        return image_contrastive_loss(torch.stack(cols, dim=1))
+
     # ---- generate (text -> image) ----
     def _generate_loss(self, x0, attention_mask, loss_mask):
         per_tok = self._cond_fpd(x0, loss_mask, lambda xt, s: self.forward(xt, s))
@@ -158,6 +194,12 @@ class UnifiedDiffusion(Diffusion):
             total = total + self.w_u * lu.loss
             metrics.update(lu.nlls, lu.token_mask)
             parts['understand'] = lu.loss
+            if self.w_c > 0:
+                lc = self._understand_contrastive(
+                    b['input_ids'], b['loss_mask'], b['image_features'],
+                    self.num_neg)
+                total = total + self.w_c * lc
+                parts['contrastive'] = lc
         if 'g' in batch:
             b = batch['g']
             lg = self._generate_loss(b['input_ids'], b['attention_mask'],
@@ -193,28 +235,39 @@ class UnifiedDiffusion(Diffusion):
         lo, hi = self.image_base, self.image_base + self.codebook_size
         for i in range(num_steps):
             t = ts[i] * torch.ones(B, 1, device=device)
-            x = self._ddpm_range(x, t, dt, lo, hi)
+            x = self._ddpm_range(x, t, dt, lo, hi, prompt_len=P)
             x[:, :P] = prompt_ids
             x[:, -1] = self.eoi_id
         # Final noise removal: fill any remaining MASK with the best valid image
         # code so no MASK (-> out-of-range code) reaches the VQ decoder.
         st = self.noise(ts[-1] * torch.ones(B, 1, device=device))[0]
         st = st.squeeze(-1) if st.ndim > 1 else st
-        lp = self.forward(x, st)
+        lp = self._guided_image_forward(x, st, prompt_len=P)
         lp[:, :, :lo] = self.neg_infinity
         lp[:, :, hi:] = self.neg_infinity
         x = torch.where(x == self.mask_index, lp.argmax(-1), x)
         img = x[:, P:P + self.vq_tokens]
         return (img - self.image_base).clamp(0, self.codebook_size - 1)
 
-    def _ddpm_range(self, x, t, dt, lo, hi):
+    def _guided_image_forward(self, x, sigma, prompt_len):
+        scale = float(self.config.sampling.get('cfg_scale', 1.0))
+        if scale == 1.0:
+            return self.forward(x, sigma)
+        x_uncond = make_unconditional_prompt(
+            x, prompt_len=prompt_len,
+            pad_token_id=self.tokenizer.pad_token_id)
+        cond = self.forward(x, sigma)
+        uncond = self.forward(x_uncond, sigma)
+        return cfg_combine_log_probs(cond, uncond, scale)
+
+    def _ddpm_range(self, x, t, dt, lo, hi, prompt_len):
         st, _ = self.noise(t)
         ss, _ = self.noise(t - dt)
         st = st.squeeze(-1) if st.ndim > 1 else st
         ss = ss.squeeze(-1) if ss.ndim > 1 else ss
         mt = (1 - torch.exp(-st))[:, None, None]
         ms = (1 - torch.exp(-ss))[:, None, None]
-        lp = self.forward(x, st)
+        lp = self._guided_image_forward(x, st, prompt_len)
         lp[:, :, :lo] = self.neg_infinity
         lp[:, :, hi:] = self.neg_infinity
         lp = lp - torch.logsumexp(lp, dim=-1, keepdim=True)

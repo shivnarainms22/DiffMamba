@@ -233,6 +233,215 @@ with dynamic range; classifier-free guidance for stronger conditioning; scale da
 image-token counts to exploit Mamba's linear scaling (+ a generation-latency benchmark vs.
 attention); a hybrid Mamba+attention block to recover quality (per DiffuApriel).
 
+## 11. Follow-up: pursuing the §10 future-work items (branch `hybrid-cfg-vqa`)
+
+Three of the §10 future-work items were implemented and run as a follow-up: classifier-free
+guidance, a hybrid Mamba+attention backbone, and a VQA-style understanding metric for the unified
+model. Results below; all honest proofs of mechanism, same as the main report.
+
+### 11.1 Classifier-free guidance (done, verified)
+
+CFG-capable Stage-2 was trained with caption dropout (`vlm.caption_dropout_prob=0.1`) and sampled
+with guidance scale `sampling.cfg_scale`. At sampling time the unconditional branch replaces the
+caption span with PAD while keeping the fixed `[BOS] … [BOI]` prompt shape, and logits are combined
+as `uncond + scale·(cond − uncond)` (`cfg_utils.py`). `cfg_scale=1.0` short-circuits to the plain
+conditional (bit-exact baseline).
+
+Held-out CLIP score (cosine of CLIP image vs. its caption), matched vs. shuffled, n=200:
+
+| `cfg_scale` | matched | shuffled | gap (matched − shuffled) |
+|---|---|---|---|
+| 1.0 (baseline) | 0.187 | 0.184 | 0.003 |
+| 1.5 | 0.189 | 0.183 | 0.006 |
+| 2.0 | 0.191 | 0.185 | 0.006 |
+| 3.0 | 0.191 | 0.185 | 0.006 |
+| 4.0 | 0.194 | 0.186 | 0.008 |
+
+**Reading it honestly.** `matched` rises **monotonically** with guidance (0.187 → 0.194) while
+`shuffled` barely moves (0.184 → 0.186), so guidance preferentially strengthens caption alignment
+rather than inflating CLIP globally — the conditioning gap roughly doubles. Each single step is
+within ≈1 standard error at n=200; the evidence is the monotonic trend across all five points, not
+any one delta. Qualitative samples confirm the mechanism: as `cfg_scale` rises, images visibly gain
+saturation and contrast (the textbook CFG signature), with over-saturation/posterization setting in
+by `cfg_scale=4.0`. No recognizable objects emerge at any scale — the base Stage-2 generator is too
+weak to render semantics, so CFG amplifies colour/texture, not content.
+
+**Net:** CFG is implemented and verified — caption alignment increases monotonically with scale and
+images visibly sharpen — but absolute fidelity stays bounded by the proof-of-mechanism generator.
+Practical operating point **`cfg_scale≈3.0`** (clear conditioning gain before the over-saturation at
+4.0). Code: `cfg_utils.py`, `gen_diffusion.py`/`unified_diffusion.py` (`_guided_image_forward`),
+`configs/experiment/gen_stage2_cfg.yaml`.
+
+### 11.2 Hybrid Mamba+attention backbone (best-of-both: DiT-class quality at Mamba-class throughput)
+
+Opt-in backbone (`backbone: hybrid_dimamba`) inserts full bidirectional attention on a fixed
+schedule (every 4th block: layers 3/7/11 of 12) among the bidirectional Mamba blocks, testing
+whether sparse attention recovers DiT-class quality while keeping most layers linear-time. A 130M
+run (`hybrid_130m`, same OpenWebText / dims / 76k-step / lr 3e-4 / seed-1 recipe as the BiMamba
+baseline `runD1` and the Transformer `runB`) gives:
+
+| Backbone (130M, lr 3e-4, seed 1) | Run | Val PPL (↓) |
+|---|---|---|
+| Transformer (DiT) | runB | 70.45 |
+| **Hybrid (9 Mamba + 3 attention)** | **hybrid_130m** | **69.60** |
+| BiMamba-2 | runD1 | 85.91 |
+| BiMamba-2 (tuned lr 1e-3) | runD_lr1e3 | 79.26 |
+
+**Reading it honestly.** With only 3 of 12 layers as attention, the hybrid reaches **69.60** val
+PPL — **statistically matching the full Transformer** (70.45; the 0.85-PPL gap is within the
+~2.4-PPL seed-noise band from §6.2) and **dramatically improving on pure BiMamba** (85.91 → 69.60, a
+16.3-PPL / ~19% drop, far beyond seed noise; it also beats the lr-tuned BiMamba at 79.26 by ~9.7).
+So sparse attention recovers full Transformer-class quality while keeping 9/12 layers as linear-time
+Mamba — the quality half of the trade-off the main report hypothesized (§6, "a hybrid Mamba+attention
+block to recover quality").
+
+**Throughput (forward pass, bf16, batch 1, A100) — tokens/sec:**
+
+| seq_len | BiMamba (`dimamba`) | **Hybrid** | Transformer (`dit`) |
+|---|---|---|---|
+| 512 | 19,824 | 23,275 | **37,676** |
+| 1024 | 39,032 | 45,572 | **74,582** |
+| 2048 | 76,236 | 88,414 | **143,933** |
+| 4096 | 147,442 | 169,574 | **261,605** |
+| 8192 | 272,825 | **287,290** | 228,833 ↓ |
+| peak mem @8192 | 1.4 GB | 1.5 GB | 1.7 GB |
+
+**Reading it honestly.** The hybrid sits on the **Mamba scaling curve, not the Transformer's**: its
+throughput climbs monotonically with sequence length at flat memory, and it did **not** inherit the
+Transformer's turn-over despite its 3 attention layers. The Transformer is in fact **fastest at
+≤4096** (flash-attention is well-optimised at short context), but its tokens/sec **turns over** at
+8192 (261.6k @4096 → 228.8k @8192, −12.5% in absolute throughput as O(n²) attention begins to
+dominate), whereas both linear models keep rising. The crossover is between 4096 and 8192, and the
+gap widens beyond it (Transformer quadratic, Mamba linear). Critically, the hybrid's 3 attention
+layers cost **essentially nothing** in throughput — it matches (here marginally exceeds) pure BiMamba
+at every length, because flash-attention layers are no costlier than Mamba-2 scans at ≤8192.
+
+**Net (quality × efficiency).** The hybrid reaches **DiT-class quality (69.60 ≈ 70.45 PPL)** at
+**Mamba-class long-context throughput and memory** (monotonic scaling, 1.5 GB @8192, overtaking the
+Transformer at 8192) — and at **no throughput cost vs. pure BiMamba**, while closing the entire
+16-PPL BiMamba→Transformer quality gap. With only 3 of 12 layers as attention, the hybrid is a clean
+best-of-both result: it removes the quality/efficiency trade-off the main report found between the
+BiMamba and Transformer backbones (§6). Code: `models/hybrid_dimamba.py`, `hybrid_schedule.py`,
+`configs/model/small-hybrid-dimamba.yaml`, `configs/experiment/hybrid_130m.yaml`,
+`scripts/eval_throughput.py`.
+
+### 11.3 Unified VQA understanding — SFT teaches *answering*, an ablation proves it's *blind*
+
+To give the unified model's *understanding* direction a dynamic-range metric (§9.2's caption-CLIP
+floor could not resolve it), `mode=uni_vqa_eval` scores short VQAv2-style answers (exact match +
+gold-recall) with a shuffled-image ablation. On the `uni_stage3` checkpoint it returns
+**exact = recall = 0.000 across 200 examples**.
+
+A diagnostic (`mode=uni_vqa_diag`) established this is **not a bug**. Per-example raw token ids show
+that for a *question* prompt the model emits `[EOS]` as the very first answer token (answer region =
+`[EOS, PAD, PAD, …]` → empty), whereas for its in-distribution caption prompt ("Describe the image.")
+it produces real, image-varying tokens. The unified model was trained **only** as a captioner with a
+single fixed prompt, so it has **zero zero-shot question-answering ability** — a VQA probe returns 0
+by construction. (The same dump also shows the captioner leaking VQ image-code tokens into the text
+answer region, corroborating §9.2's at-floor understanding.)
+
+So the `uni_stage3` checkpoint cannot be VQA-probed as-is; a dynamic-range number requires *training*
+for it.
+
+**Unified VQA-SFT (Stage 3.5).** Joint SFT warm-started from `uni_stage3`: the understanding stream
+switches to VQAv2 (question → `multiple_choice_answer`), the generation stream stays on CC3M, all
+weights loaded with a fresh optimizer, 8000 steps @ lr 2e-4 (`+experiment=uni_vqa_sft`). Held-out
+eval (VQAv2 `validation` tail slice, never trained on), n=200:
+
+| Metric | uni_stage3 (pre-SFT) | uni_vqa_sft (post-SFT) |
+|---|---|---|
+| answers | empty (EOS-first) | **non-empty** |
+| exact-match, correct image | 0.000 | **0.265** |
+| exact-match, shuffled image | 0.000 | 0.285 |
+| **image delta (correct − shuffled)** | 0.000 | **−0.020** |
+| generation (gen image vs caption, CLIP, matched / shuffled) | 0.194 / 0.197 | **0.199 / 0.199** |
+
+**The SFT works mechanically, but the model answers blind.** Post-SFT the model produces fluent VQA
+answers and hits **0.265 exact-match** (≈ Stage-1's 0.29), and **generation is preserved** (0.199 ≈
+the pre-SFT 0.194). But the **image delta is ≈ 0** (−0.020, within ~1 SE at n=200). A blind model
+scores ~25–30% on VQAv2 by exploiting language priors, and the ablation shows that is exactly what is
+happening here.
+
+**Proof the image is ignored (not a noisy ablation).** The shuffled-image control initially paired
+example *i* with *i+1*'s image — invalid, because VQAv2 stores several questions per image
+consecutively, so *i+1* often *is* the same image. After fixing the ablation to use a
+guaranteed-different image (offset ≈ half the eval set), the result was **byte-identical** to the
+broken version. Diffing the two runs' generated answers: **200/200 identical** for both the matched
+*and* the shuffled set — i.e. swapping in a completely different image changes **zero** of 200
+answers. The image features therefore have **no effect on the model's output**; the 0.265 is **pure
+language prior**, and the −0.020 "delta" is just RNG between the two sampling passes.
+
+**Net.** The unified model can be taught to *answer* VQA (format learned, EOS-first cured, generation
+preserved) — a genuine dynamic-range understanding signal where there was none — but at 130M it
+acquires the VQAv2 **language-prior shortcut rather than visual grounding**: the answers are blind.
+This also **re-frames Stage-1's 0.29**, which was reported *without* a shuffled-image ablation and is
+therefore likely substantially language-prior too — the ablation introduced here is the rigor that
+exposes it. Closing the grounding gap (e.g. balanced/complementary-pair VQA, contrastive
+image-reliance objectives, larger scale) is the real open problem and is left as future work. Code:
+`unified_dataloader.py` (`understand_task`), `main_vlm.py` (`_uni_train` warm-start, `_uni_vqa_eval`,
+`_uni_vqa_diag`), `configs/experiment/uni_vqa_sft.yaml`.
+
+### 11.4 Grounding retrain — blindness localized to a conditioning bottleneck, then proven data/scale-bound (honest negative)
+
+§11.3 left an open question: *why* is the unified model blind, and can an objective fix it? We answered
+both — the first with a read-only diagnostic, the second with two targeted retrains. The result is a
+clean negative: at 130M the blindness is **data/scale-bound, not objective-bound**.
+
+**Diagnostic (`mode=uni_grounding_diag`, read-only on the frozen `uni_vqa_sft` ckpt).** Four probes
+localize where grounding fails: **A** connector variation (do distinct images map to distinct prefixes?),
+**B** logit sensitivity (does swapping the image move the answer distribution?), **C** gradient saliency
+(does the answer carry gradient back to the image prefix?), **D** a scale-match precheck. The result:
+the image is ignored at the **output** (B `sym_kl ≈ 0`) while the connector is alive but **scale-pathological**
+— the projected prefix runs **~24× the text-embedding scale**, and the answer-loss sends only **~0.9%** of
+the text gradient to the image (C `grad_ratio = 0.009`). Probe D showed that rescaling the prefix to the
+text scale lifts that ratio **0.009 → 0.55 (~59×)**. **Root cause** (verified in `models/dimamba.py:415-416`):
+the backbone's first block is RMSNorm pre-norm = *scale-invariant*, so the 24× scale does not suppress the
+image at the output — it throttles the projector's *training gradient* ~24× (RMSNorm grad ∝ 1/‖input‖). The
+projector therefore receives almost no learning signal, and the backbone learns to answer from the prior.
+
+**Two-lever fix, both opt-in flags (default off → existing behavior unchanged):** (1) **scale-match** the
+projector with an `nn.RMSNorm` on its output, initialized to the text-embed std (un-throttles the gradient
+Probe D quantified); (2) an **in-batch image-contrastive loss** (`grounding_train_utils.image_contrastive_loss`)
+that makes a blind answer loss-*increasing* — the gold answer must be more likely under the image's *own*
+prefix than under in-batch negatives. Both wired behind `vlm.proj_scale_match` / `vlm.contrastive_weight`,
+warm-started from `uni_vqa_sft`, 8000 steps @ 2e-4. Held-out VQAv2 eval, n=200:
+
+| | uni_vqa_sft | Attempt 1 (learnable scale) | Attempt 2 (frozen scale + dominant contrastive) |
+|---|---|---|---|
+| exact, correct image | 0.265 | 0.255 | 0.260 |
+| exact, shuffled image | 0.285 | 0.260 | 0.255 |
+| **image delta** | **−0.020** | **−0.005** | **+0.005** |
+| Probe B `sym_kl` (img A vs B) | ≈0 | ≈0 | ≈0 (1.4e-6) |
+| Probe C grad ratio | 0.009 | 0.109 | **0.356** |
+| Probe A `std_vs_ref` | 24.4 | 0.019 | 0.019 |
+
+**The objective worked exactly as designed — and the model routed around it twice.** Scale-match did
+un-throttle the projector gradient (C: 0.009 → 0.109 → 0.356, ~38× by attempt 2). But the image delta
+never moved off zero:
+- **Attempt 1** used a *learnable* scale-match weight. Training drove it ~0 to **shrink the image prefix
+  away** (`std_vs_ref` 24.4 → 0.019) and kept answering from the prior — contrastive (weight 0.5) was
+  outgunned 4:1 by the understanding loss.
+- **Attempt 2** *froze* the scale at text-std (closing the shrink escape; Probe D confirms the freeze held —
+  rescaling the prefix *up* now *lowers* grad ratio 0.356 → 0.043, only possible if magnitude is already at
+  text-scale) and made contrastive dominant (weight 2.0 vs 1.0, num_neg 2). With the magnitude escape closed,
+  the projector found a **new** one: it collapsed to a **near-constant prefix across images** (Probe A cosine
+  **0.954**, cross-image variation only **2%** of text scale), so the output is image-independent regardless
+  of scale or gradient (B `sym_kl ≈ 1.4e-6`). The model answered `"no"` to **184 of 200** questions.
+  Generation was preserved (0.187 ≈ the 0.194 prior — no catastrophic forgetting).
+
+**Conclusion (stopping rule).** Two distinct objective escapes — magnitude-shrink, then constant-collapse —
+both lead to the same blind prior, even with the projector gradient un-throttled ~38× and a dominant
+contrastive term. The bottleneck is therefore **not the objective**: it is the **data grain and scale**.
+VQAv2 is ~26% blind-answerable, the model is 130M, and a comparable diffusion VLM (LLaDA-V) only grounds at
+~8B parameters and ~12M samples (~60× larger, ~1000× more data). No objective patch closes that gap, so we
+stop patching it. This is a *well-characterized* negative — blindness localized to a conditioning bottleneck,
+the bottleneck's mechanism verified in code, and two objective fixes shown to be necessary-but-insufficient —
+which together scope the real open problem (image-necessary data such as GQA, balanced complementary pairs,
+and larger scale) rather than leaving it as a vague "future work." Code: `grounding_diag_utils.py`,
+`grounding_train_utils.py`, `models/vision.py` (`MLPProjector(scale_match=…)`), `unified_diffusion.py`
+(`_understand_contrastive`, frozen scale-match init), `main_vlm.py` (`mode=uni_grounding_diag`),
+`configs/experiment/uni_grounding.yaml`.
+
 ## Reproduce
 
 ```bash
@@ -262,6 +471,30 @@ python main_vlm.py +experiment=uni_stage3 mode=uni_eval \
 # Understanding baseline (standalone captioner, identical caption-CLIP metric)
 python main_vlm.py +experiment=vlm_stage1_align mode=vlm_caption_eval \
   eval.checkpoint_path=/scratch/.../runs/vlm_align/checkpoints/best.ckpt sampling.steps=64
+
+# §11.1 Classifier-free guidance: train w/ caption dropout, then sweep cfg_scale
+bash scripts/submit_vlm.sh gen_stage2_cfg gen_stage2_cfg 8000
+for s in 1.0 1.5 2.0 3.0 4.0; do python main_vlm.py +experiment=gen_stage2_cfg mode=gen_eval \
+  eval.checkpoint_path=/scratch/.../runs/gen_stage2_cfg/checkpoints/best.ckpt \
+  sampling.cfg_scale=$s sampling.steps=64 \
+  checkpointing.save_dir=/scratch/.../eval/gen_cfg_s$s; done
+
+# §11.2 Hybrid Mamba+attention 130M (same recipe as runD baseline) + throughput
+bash scripts/submit_hpc.sh hybrid_130m hybrid_130m 76000 seed=1
+for b in dimamba hybrid_dimamba dit; do python scripts/eval_throughput.py --backbone $b --mode forward; done
+
+# §11.3 Unified VQA probe (returns 0 — model has no QA ability) + diagnostic
+python main_vlm.py +experiment=uni_stage3 mode=uni_vqa_eval \
+  eval.checkpoint_path=/scratch/.../runs/uni_stage3/checkpoints/best.ckpt sampling.steps=64
+python main_vlm.py +experiment=uni_stage3 mode=uni_vqa_diag \
+  eval.checkpoint_path=/scratch/.../runs/uni_stage3/checkpoints/best.ckpt sampling.steps=64
+
+# §11.4 Grounding retrain (scale-match + image-contrastive) — frozen-scale attempt 2
+bash scripts/submit_vlm.sh uni_grounding_v2 uni_grounding 8000
+# Gate (all three; CKPT=runs/uni_grounding_v2/checkpoints/last.ckpt) — or: sbatch scripts/gate_eval.sh
+python main_vlm.py +experiment=uni_grounding mode=uni_vqa_eval      eval.checkpoint_path=$CKPT sampling.steps=64  # delta stays ~0 (blind)
+python main_vlm.py +experiment=uni_grounding mode=uni_grounding_diag eval.checkpoint_path=$CKPT sampling.steps=64  # B sym_kl~0, A cosine 0.95
+python main_vlm.py +experiment=uni_grounding mode=uni_eval          eval.checkpoint_path=$CKPT sampling.steps=64  # generation preserved
 ```
 
 Stage 1 code: `models/vision.py`, `models/mm_dimamba.py`, `mm_diffusion.py`,

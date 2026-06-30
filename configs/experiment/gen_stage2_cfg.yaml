@@ -1,0 +1,16 @@
+# @package _global_
+#
+# Stage 2 CFG variant. Train with caption dropout, then sample/evaluate with
+# sampling.cfg_scale > 1.0 to strengthen caption conditioning.
+
+defaults:
+  - gen_stage2
+
+vlm:
+  caption_dropout_prob: 0.1
+
+checkpointing:
+  save_dir: /scratch/sarin.s/DiffMamba/runs/gen_stage2_cfg
+
+wandb:
+  name: gen_stage2_cfg

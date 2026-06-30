@@ -3,18 +3,30 @@ import torch.nn as nn
 
 
 class MLPProjector(nn.Module):
-  """LLaVA-1.5 style 2-layer GELU projector: vision_dim -> lm_dim."""
+  """LLaVA-1.5 style 2-layer GELU projector: vision_dim -> lm_dim.
 
-  def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 2048):
+  When ``scale_match`` is set, an RMSNorm on the output fixes its scale (its
+  learnable weight is initialized by the caller to the text-embed std). The
+  backbone's first block is RMSNorm pre-norm (scale-invariant), so a too-hot
+  projector output does not change the forward but throttles the projector's
+  training gradient ~1/scale; this normalizes the output so that gradient flows.
+  """
+
+  def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 2048,
+               scale_match: bool = False):
     super().__init__()
     self.net = nn.Sequential(
       nn.Linear(in_dim, hidden_dim),
       nn.GELU(),
       nn.Linear(hidden_dim, out_dim),
     )
+    self.out_norm = nn.RMSNorm(out_dim) if scale_match else None
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    return self.net(x)
+    y = self.net(x)
+    if self.out_norm is not None:
+      y = self.out_norm(y)
+    return y
 
 
 class SiglipVisionTower(nn.Module):
