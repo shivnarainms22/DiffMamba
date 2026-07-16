@@ -121,7 +121,7 @@ for r in ${RUNS}; do
     if ! python main.py \
             +experiment="${r}" \
             mode=ppl_eval \
-            eval.checkpoint_path="${CKPT}" \
+            "eval.checkpoint_path='${CKPT}'" \
             data.cache_dir="${SCRATCH}/data" \
             hydra.run.dir="${SCRATCH}/DiffMamba/eval/${r}" \
             wandb=null 2>&1 | tee "${OUT}"; then
