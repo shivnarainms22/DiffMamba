@@ -5,7 +5,8 @@
 # Auto-rechains: submits the next job segment before training starts so the
 # chain survives even if this job is hard-killed at wall time.
 # Each new segment resumes from last.ckpt. Once global_step >= MAX_STEPS the
-# next submitted segment exits immediately.
+# next submitted segment exits immediately. A segment that starts from the same
+# step as its predecessor refuses to chain (see "loop breaker" below).
 #
 # Env vars injected by submit_hpc.sh / sbatch --export:
 #   RUN_NAME    e.g. runD1
@@ -109,8 +110,27 @@ print(ckpt.get('global_step', 0))
         exit 0
     fi
 else
+    STEP=0
     echo "No checkpoint found — starting from scratch."
 fi
+
+# ---------- loop breaker ----------
+# The chain is submitted pre-emptively below, so a segment that dies without
+# training still spawns a successor. If two consecutive segments start from the
+# same step, no progress is being made and chaining would recur forever. Fail
+# closed instead. A segment killed before its first checkpoint save trips this
+# too -- that is intended: it means something is wrong and needs a human.
+
+PROGRESS_MARKER="${RUN_DIR}/.last_segment_start_step"
+PREV_STEP=$(cat "${PROGRESS_MARKER}" 2>/dev/null || echo "-1")
+
+if [[ "${STEP}" -eq "${PREV_STEP}" ]]; then
+    echo "ERROR: previous segment also started at step ${STEP} and made no progress."
+    echo "Refusing to queue another segment. Inspect the log above, then resubmit."
+    exit 1
+fi
+
+echo "${STEP}" > "${PROGRESS_MARKER}"
 
 # ---------- pre-emptive chain submission ----------
 # Submit the next segment NOW (before training), so the chain survives
@@ -130,13 +150,25 @@ echo
 
 cd "${REPO}"
 
+# trainer.max_steps MUST be overridden here. Every experiment config bakes in
+# max_steps: 76_000, so without this the trainer stops the instant it resumes at
+# 76000 while the shell check above still believes MAX_STEPS (e.g. 150000) of work
+# remains -- and the pre-queued successor repeats that forever (157-job crash loop,
+# 2026-07-19). The shell's notion of "done" and the trainer's must come from the
+# same number.
+TRAIN_RC=0
 python main.py \
     +experiment="${EXPERIMENT}" \
     ${EXTRA_ARGS:-} \
     data.cache_dir="${SCRATCH}/data" \
     hydra.run.dir="${RUN_DIR}" \
+    trainer.max_steps="${MAX_STEPS}" \
     checkpointing.resume_from_ckpt=true \
-    || echo "Training exited with non-zero status (SIGTERM checkpoint save is normal)."
+    || TRAIN_RC=$?
+
+if [[ "${TRAIN_RC}" -ne 0 ]]; then
+    echo "Training exited ${TRAIN_RC} (SIGTERM checkpoint save at wall time is normal)."
+fi
 
 echo
 echo "=== Job ${SLURM_JOB_ID} done at $(date) ==="
