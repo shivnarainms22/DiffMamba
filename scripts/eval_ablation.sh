@@ -97,6 +97,13 @@ for r in ${RUNS}; do
     echo "=================================================================="
     echo "=== ${r} | $(date) ==="
 
+    # Extra-seed runs are named <experiment>_s<N> (e.g. hyb_e3_s2 = seed 2 of
+    # experiment hyb_e3), matching how submit_hpc.sh is invoked. There is no
+    # hyb_e3_s2.yaml, so derive the experiment config by stripping the seed
+    # suffix; runs whose name is already the experiment are unchanged.
+    EXP="${r}"
+    [[ "${r}" =~ ^(.+)_s[0-9]+$ ]] && EXP="${BASH_REMATCH[1]}"
+
     CKPT="${RUNS_DIR}/${r}/checkpoints/step=${EXPECTED_STEPS}.ckpt"
     [[ -f "${CKPT}" ]] || CKPT="${RUNS_DIR}/${r}/checkpoints/last.ckpt"
     if [[ ! -f "${CKPT}" ]]; then
@@ -119,7 +126,7 @@ for r in ${RUNS}; do
     # and the arch line proves which attention layout was actually evaluated.
     OUT="${LOG_DIR}/eval_${r}_${SLURM_JOB_ID:-local}.out"
     if ! python main.py \
-            +experiment="${r}" \
+            +experiment="${EXP}" \
             mode=ppl_eval \
             "eval.checkpoint_path='${CKPT}'" \
             data.cache_dir="${SCRATCH}/data" \
