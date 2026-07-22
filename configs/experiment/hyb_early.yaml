@@ -1,0 +1,42 @@
+# @package _global_
+#
+# Ablation Arm B (placement): 3 attention layers clustered EARLY -> [0,1,2].
+# Param-matched to the hybrid_130m baseline (3 attn at distributed [3,7,11])
+# and to hyb_mid / hyb_late, so PPL differences isolate WHERE attention goes,
+# with parameter count held constant. Uses an explicit layer list (overrides
+# the model's every/offset schedule).
+
+defaults:
+  - override /model: small-hybrid-dimamba
+  - override /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor, sigterm_save]
+
+backbone: hybrid_dimamba
+parameterization: subs
+mode: train
+
+model:
+  hybrid_attention_layers: [0, 1, 2]
+
+trainer:
+  max_steps: 76_000
+  val_check_interval: 5000
+  gradient_clip_val: 1.0
+  precision: 'bf16-mixed'
+
+loader:
+  global_batch_size: 64
+  batch_size: 8
+
+optim:
+  lr: 3e-4
+  weight_decay: 0.01
+
+wandb:
+  name: hyb_early
+
+callbacks:
+  hf_hub_uploader:
+    _target_: hf_hub_callback.HFHubUploadCallback
+    repo_id: ${oc.env:HF_HUB_REPO_ID,null}
+    every_n_train_steps: 5000
+    path_in_repo: hyb_early_seed${seed}

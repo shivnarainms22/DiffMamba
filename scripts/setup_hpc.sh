@@ -26,8 +26,23 @@ echo
 module load anaconda3/2024.06
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
+ENV_PY="${HOME}/.conda/envs/diffmamba/bin/python"
+
+# A name check alone is not enough. This env lives on /scratch (via the
+# ~/.conda -> /scratch symlink), and scratch purges by access time. Python only
+# stats its stdlib .py sources, so they go stale and get reaped while __pycache__
+# stays — leaving an env that `conda env list` still shows but whose interpreter
+# dies at startup with "no codec search functions registered" (encodings gone).
+# So probe the interpreter itself; recreate a broken one instead of skipping it.
 if conda env list | grep -q "^diffmamba "; then
-    echo "conda env 'diffmamba' already exists — skipping create."
+    if "${ENV_PY}" -c "import encodings" 2>/dev/null; then
+        echo "conda env 'diffmamba' exists and its interpreter is healthy — skipping create."
+    else
+        echo "conda env 'diffmamba' exists but its interpreter is BROKEN (stdlib purged) — recreating."
+        conda deactivate 2>/dev/null || true
+        conda env remove -n diffmamba -y
+        conda create -n diffmamba python=3.11 -y
+    fi
 else
     echo "Creating conda env 'diffmamba' (Python 3.11)..."
     conda create -n diffmamba python=3.11 -y

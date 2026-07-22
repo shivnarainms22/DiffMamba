@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from hybrid_schedule import is_attention_layer
+from hybrid_schedule import attention_layer_indices, is_attention_layer
 from models.dimamba import BiMambaWrapper, _MAMBA2_DEFAULTS
 from models.dit import (
     DDiTBlock,
@@ -72,6 +72,9 @@ class HybridDiMamba(nn.Module):
         n_layers = m.n_blocks
         every = int(m.get('hybrid_attention_every', 4))
         offset = int(m.get('hybrid_attention_offset', every - 1))
+        explicit_raw = m.get('hybrid_attention_layers', None)
+        explicit = ([int(x) for x in explicit_raw]
+                    if explicit_raw is not None else None)
         dropout = float(m.get('dropout', 0.1))
 
         ssm_cfg_raw = getattr(m, 'ssm_cfg', None)
@@ -85,7 +88,7 @@ class HybridDiMamba(nn.Module):
         self.blocks = nn.ModuleList()
         self.layer_types = []
         for i in range(n_layers):
-            if is_attention_layer(i, n_layers, every, offset):
+            if is_attention_layer(i, n_layers, every, offset, explicit=explicit):
                 self.blocks.append(DDiTBlock(
                     hidden, m.n_heads, cond_dim, dropout=dropout))
                 self.layer_types.append('attention')
@@ -93,6 +96,15 @@ class HybridDiMamba(nn.Module):
                 self.blocks.append(HybridMambaBlock(
                     hidden, cond_dim, ssm_cfg=ssm_cfg, dropout=dropout))
                 self.layer_types.append('mamba')
+
+        # Log the resolved schedule once at construction so any run can be
+        # grep-confirmed to train the INTENDED architecture (a wrong schedule
+        # silently trained for 76k steps is the costly failure to avoid).
+        attn_idx = attention_layer_indices(n_layers, every, offset,
+                                           explicit=explicit)
+        print(f'[HybridDiMamba] n_blocks={n_layers} '
+              f'attention_layers={attn_idx} ({len(attn_idx)} attn / '
+              f'{n_layers - len(attn_idx)} mamba)', flush=True)
 
         self.output_layer = DDitFinalLayer(hidden, vocab_size, cond_dim)
         self.scale_by_sigma = m.scale_by_sigma

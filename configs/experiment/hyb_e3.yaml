@@ -1,0 +1,43 @@
+# @package _global_
+#
+# Ablation Arm A (count): attention every 3rd block -> layers [2,5,8,11] = 4
+# attention layers (vs the hybrid_130m baseline's 3 at [3,7,11]). All other
+# hyperparameters are identical to hybrid_130m so PPL differences isolate the
+# attention COUNT. Note: attention blocks (DDiTBlock, mlp_ratio=4) carry more
+# params than Mamba blocks, so report param counts alongside PPL.
+
+defaults:
+  - override /model: small-hybrid-dimamba
+  - override /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor, sigterm_save]
+
+backbone: hybrid_dimamba
+parameterization: subs
+mode: train
+
+model:
+  hybrid_attention_every: 3
+  hybrid_attention_offset: 2
+
+trainer:
+  max_steps: 76_000
+  val_check_interval: 5000
+  gradient_clip_val: 1.0
+  precision: 'bf16-mixed'
+
+loader:
+  global_batch_size: 64
+  batch_size: 8
+
+optim:
+  lr: 3e-4
+  weight_decay: 0.01
+
+wandb:
+  name: hyb_e3
+
+callbacks:
+  hf_hub_uploader:
+    _target_: hf_hub_callback.HFHubUploadCallback
+    repo_id: ${oc.env:HF_HUB_REPO_ID,null}
+    every_n_train_steps: 5000
+    path_in_repo: hyb_e3_seed${seed}
