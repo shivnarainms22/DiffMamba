@@ -323,7 +323,8 @@ Transformer at 8192) — and at **no throughput cost vs. pure BiMamba**, while c
 best-of-both result: it removes the quality/efficiency trade-off the main report found between the
 BiMamba and Transformer backbones (§6). Code: `models/hybrid_dimamba.py`, `hybrid_schedule.py`,
 `configs/model/small-hybrid-dimamba.yaml`, `configs/experiment/hybrid_130m.yaml`,
-`scripts/eval_throughput.py`.
+`scripts/eval_throughput.py`. **§11.5 ablates the attention layout used here** (how many attention
+layers and where) and over-trains the winner to 150k steps, improving this 69.60 to **61.21**.
 
 ### 11.3 Unified VQA understanding — SFT teaches *answering*, an ablation proves it's *blind*
 
@@ -442,6 +443,69 @@ and larger scale) rather than leaving it as a vague "future work." Code: `ground
 (`_understand_contrastive`, frozen scale-match init), `main_vlm.py` (`mode=uni_grounding_diag`),
 `configs/experiment/uni_grounding.yaml`.
 
+### 11.5 Attention-layout ablation — how many attention layers, where, and does training longer help?
+
+§11.2 fixed the hybrid's attention at *every 4th block* (3 layers, `[3,7,11]`) and showed that
+recovers DiT-class quality. That leaves two questions it did not isolate — **how many** attention
+layers the hybrid actually needs, and **where** they should sit — plus one the 76k budget left open:
+**does the winner keep improving if trained longer?** This ablation answers all three. Seven configs,
+**byte-identical outside the attention layout**, were trained on the same OpenWebText / 130M / 76k-step /
+lr-3e-4 / seed-1 recipe and scored with the same val-PPL eval as §11.2. Each attention layer adds only
+~48k parameters (**<0.03%** of the 169.2M backbone), so the count axis is a pure count effect with no
+parameter confound. **Harness check:** the shared baseline `hybrid_130m` re-evaluated to **69.49**,
+reproducing its §11.2 headline of 69.60 (0.11 PPL = re-eval noise) — so the ablation eval path is sound
+and every row below is trustworthy.
+
+**Arm A — count (attention layers distributed through depth):**
+
+| Run | Attention layers | # attn | Val PPL (↓) | Δ vs baseline |
+|---|---|---:|---:|---:|
+| **hyb_e3** | `[2,5,8,11]` | 4 | **68.07** | **−1.42 (best)** |
+| hybrid_130m | `[3,7,11]` | 3 | 69.49 | — baseline |
+| hyb_e6 | `[5,11]` | 2 | 71.44 | +1.95 |
+| hyb_e12 | `[11]` | 1 | 75.66 | +6.17 |
+
+**Arm B — placement (count fixed at 3):**
+
+| Run | Attention layers | Placement | Val PPL (↓) | Δ vs baseline |
+|---|---|---|---:|---:|
+| hybrid_130m | `[3,7,11]` | distributed | 69.49 | — baseline |
+| hyb_late | `[9,10,11]` | clustered late | 72.98 | +3.49 |
+| hyb_mid | `[4,5,6]` | clustered mid | 73.87 | +4.38 |
+| hyb_early | `[0,1,2]` | clustered early | 80.83 | +11.35 |
+
+**Reading it honestly.** Two clean findings. (1) **Count is monotonic** — more attention lowers PPL at
+near-zero parameter cost (4 → 68.07, 3 → 69.49, 2 → 71.44, 1 → 75.66; range 7.6 PPL across 1→4 layers).
+(2) **Placement matters *more* than count.** At a fixed 3 attention layers, spreading them through depth
+(`[3,7,11]`, 69.49) beats every clustered variant, and clustering degrades smoothly from late (72.98) to
+mid (73.87) to early (80.83, catastrophic). The placement range (**11.35 PPL**) is *wider* than the whole
+count range (7.6) — **where** the attention goes matters more than **how much**, provided it is
+distributed. `hyb_e3` (`[2,5,8,11]`, 4 layers, evenly spread) wins on both axes and is the ablation winner.
+
+**Over-training the winner (76k → 150k steps, two seeds).** The LR schedule is `constant_warmup` (no decay
+after 2500), so resuming simply keeps learning. Extending `hyb_e3` to 150k steps drops PPL hard and
+*stably* across seeds:
+
+| Run (hyb_e3, `[2,5,8,11]`) | Steps | Val PPL (↓) |
+|---|---:|---:|
+| seed 1 | 76000 | 68.07 |
+| **seed 1** | **150000** | **60.91** |
+| **seed 2** | **150000** | **61.52** |
+
+**Headline: 61.21 mean ± 0.30 (seeds 60.91 / 61.52).** The extra 74k steps buy **≈ −6.9 PPL** (68.07 →
+61.21) — larger than the entire count-axis range — and the **seed spread of 0.61 PPL is smaller than any
+gap in the grid** (min ~1.4), so the improvement is a stable property of the configuration, not a lucky
+seed. Both seeds sit far below the 76k baseline (69.49). **Caveat on comparisons:** this 61.21 is at 150k
+steps, whereas the §11.2 DiT (70.45) and all grid rows are at 76k — so 61.21 is *not* a matched-compute
+claim against the DiT; the matched-compute results are the 76k grid above. The honest matched-compute story
+is unchanged (sparse distributed attention matches the DiT at 76k); over-training simply shows the hybrid
+has substantial headroom the 76k budget left on the table.
+
+**Net.** Distribute attention through depth (placement > count) + use 4 of 12 layers + train to 150k ⇒ the
+hybrid backbone goes from the §11.2 headline of **69.60 to 61.21**. Code/configs: `configs/experiment/hyb_e3.yaml`
+(and `hyb_e6`, `hyb_e12`, `hyb_early`, `hyb_mid`, `hyb_late`), `hybrid_schedule.py`, `scripts/eval_ablation.sh`
+(batch PPL eval), `scripts/submit_hpc.sh` (self-chaining training).
+
 ## Reproduce
 
 ```bash
@@ -495,6 +559,13 @@ bash scripts/submit_vlm.sh uni_grounding_v2 uni_grounding 8000
 python main_vlm.py +experiment=uni_grounding mode=uni_vqa_eval      eval.checkpoint_path=$CKPT sampling.steps=64  # delta stays ~0 (blind)
 python main_vlm.py +experiment=uni_grounding mode=uni_grounding_diag eval.checkpoint_path=$CKPT sampling.steps=64  # B sym_kl~0, A cosine 0.95
 python main_vlm.py +experiment=uni_grounding mode=uni_eval          eval.checkpoint_path=$CKPT sampling.steps=64  # generation preserved
+
+# §11.5 Attention-layout ablation: train the grid (76k, seed 1), then over-train the winner to 150k
+for e in hyb_e3 hyb_e6 hyb_e12 hyb_early hyb_mid hyb_late; do bash scripts/submit_hpc.sh $e $e 76000 seed=1; done
+RUNS="hybrid_130m hyb_e3 hyb_e6 hyb_e12 hyb_early hyb_mid hyb_late" sbatch --export=ALL,RUNS scripts/eval_ablation.sh  # grid PPL table
+bash scripts/submit_hpc.sh hyb_e3    hyb_e3 150000 seed=1   # over-train winner 76k->150k
+bash scripts/submit_hpc.sh hyb_e3_s2 hyb_e3 150000 seed=2   # second seed for the variance bar
+RUNS="hyb_e3 hyb_e3_s2" EXPECTED_STEPS=150000 sbatch --export=ALL,RUNS,EXPECTED_STEPS scripts/eval_ablation.sh  # -> 60.91 / 61.52
 ```
 
 Stage 1 code: `models/vision.py`, `models/mm_dimamba.py`, `mm_diffusion.py`,
