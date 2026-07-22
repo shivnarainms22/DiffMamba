@@ -64,6 +64,19 @@ This is consistent with the prior work below, where a *hybrid* Mamba+attention
 model is what recovers quality. Full numbers, caveats, and the LR-fairness
 analysis are in the [report](./DiffMamba_Report.md).
 
+**Hybrid backbone — the quality gap, closed (best result here).** Inserting
+sparse bidirectional attention into the BiMamba backbone recovers full DiT-class
+quality. At matched 130M / 76k / lr 3e-4, just **3 of 12 layers as attention**
+(`[3,7,11]`) reaches **69.6 val PPL**, statistically matching the Transformer
+(70.5) while keeping 9/12 layers linear-time. An attention-layout ablation then
+shows **placement matters more than count** — distribute attention through depth
+(clustering it early is catastrophic, 80.8 PPL), and **4 evenly-spread layers**
+(`[2,5,8,11]`) is best. Over-training that winner to 150k steps reaches **61.2
+val PPL** (2-seed mean ±0.3) — the strongest quality result in this study, though
+at ~2× the compute of the matched table above (so not a matched-compute claim
+against the 70.5 DiT). Ablation grid, placement analysis, and the over-train
+detail are in [VLM report §11.5](./DiffMamba_VLM_Report.md).
+
 ---
 
 ## Quickstart
